@@ -1,0 +1,229 @@
+# =============================================================================
+# Local development stack for mcp-enterprise-gateway.
+#
+#   gateway         MCP endpoint + control-plane API   http://localhost:8000
+#   crm-ops         sample MCP server: NOT published, reachable from the gateway only
+#   postgres        approval records (gateway) and LangGraph checkpoints
+#                   (agent-runtime), in separate databases owned by separate roles
+#   redis           budget ledgers, loop-detection windows, breaker state, events
+#   otel-collector  the single OTLP ingress for every service
+#   jaeger          traces       http://localhost:16686
+#   prometheus      metrics      http://localhost:9090
+# agent-runtime and operator-ui join in Phase 3.
+#
+# Network zones mirror the AWS security groups:
+#   edge      clients -> gateway            upstream  gateway <-> MCP servers (internal)
+#   data      gateway -> postgres, redis    telemetry services -> collector -> backends
+#
+# Secrets have no defaults: `make env` writes .env with random values, and
+# Compose refuses to start without them. Published ports bind to 127.0.0.1.
+# =============================================================================
+name: mcp-gateway
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardened: &hardened
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging: *logging
+
+services:
+  postgres:
+    <<: *hardened
+    image: postgres:17.12-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set - run `make env`}
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --data-checksums
+      # Read once, on first start, by initdb/10-service-databases.sh
+      GATEWAY_DB_NAME: ${GATEWAY_DB_NAME:-mcp_gateway}
+      GATEWAY_DB_USER: ${GATEWAY_DB_USER:-mcp_gateway}
+      GATEWAY_DB_PASSWORD: ${GATEWAY_DB_PASSWORD:?GATEWAY_DB_PASSWORD is not set - run `make env`}
+      AGENT_DB_NAME: ${AGENT_DB_NAME:-agent_runtime}
+      AGENT_DB_USER: ${AGENT_DB_USER:-agent_runtime}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?AGENT_DB_PASSWORD is not set - run `make env`}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/local/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # TCP, not the socket: during initialisation the server listens on the unix
+      # socket only, so this stays unhealthy until the service databases exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    networks: [data]
+
+  redis:
+    <<: *hardened
+    image: redis:7.2.17-alpine # do not exceed the ElastiCache engine's feature set
+    # noeviction: an evicted ledger or breaker key would silently reset a budget or
+    # re-open a tripped session, so writes fail (and the gateway fails closed) instead.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is not set - run `make env`}
+    environment:
+      # lets the healthcheck and `docker compose exec redis redis-cli` authenticate
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set - run `make env`}
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data]
+
+  gateway:
+    <<: *hardened
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    image: mcp-enterprise-gateway/gateway:local
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: [/tmp]
+    environment:
+      GATEWAY_ENVIRONMENT: local
+      GATEWAY_DATABASE_HOST: postgres
+      GATEWAY_DATABASE_NAME: ${GATEWAY_DB_NAME:-mcp_gateway}
+      GATEWAY_DATABASE_USER: ${GATEWAY_DB_USER:-mcp_gateway}
+      GATEWAY_DATABASE_PASSWORD: ${GATEWAY_DB_PASSWORD:?GATEWAY_DB_PASSWORD is not set - run `make env`}
+      GATEWAY_DATABASE_SSL: disable # container network only
+      GATEWAY_REDIS_HOST: redis
+      GATEWAY_REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set - run `make env`}
+      GATEWAY_UPSTREAMS: '{"crm-ops": "http://crm-ops:8001/mcp"}'
+      GATEWAY_UPSTREAM_SIGNING_KEY: ${UPSTREAM_ASSERTION_KEY:?UPSTREAM_ASSERTION_KEY is not set - run `make env`}
+      # Local development verifies HS256 tokens minted by `make token`; deployed
+      # environments verify the enterprise IdP's RS256/ES256 tokens via JWKS.
+      GATEWAY_JWT_ALGORITHMS: '["HS256"]'
+      GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET is not set - run `make env`}
+      GATEWAY_JWT_ISSUER: ${GATEWAY_JWT_ISSUER:-http://localhost/dev-idp}
+      GATEWAY_WEBHOOK_URL: ${GATEWAY_WEBHOOK_URL:-}
+      GATEWAY_WEBHOOK_HMAC_KEY: ${WEBHOOK_HMAC_KEY:?WEBHOOK_HMAC_KEY is not set - run `make env`}
+      GATEWAY_CORS_ORIGINS: '["http://localhost:3000"]' # operator console (Phase 3)
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+    ports:
+      - "127.0.0.1:${GATEWAY_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      crm-ops:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks: [edge, data, upstream, telemetry]
+
+  crm-ops:
+    <<: *hardened
+    build:
+      context: .
+      dockerfile: mcp-servers/crm-ops/Dockerfile
+    image: mcp-enterprise-gateway/crm-ops:local
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: [/tmp]
+    environment:
+      CRM_OPS_ENVIRONMENT: local
+      CRM_OPS_GATEWAY_ASSERTION_KEY: ${UPSTREAM_ASSERTION_KEY:?UPSTREAM_ASSERTION_KEY is not set - run `make env`}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+    # No published ports and no edge network: agents cannot reach it, only the gateway.
+    networks: [upstream, telemetry]
+
+  otel-collector:
+    <<: *hardened
+    image: otel/opentelemetry-collector-contrib:0.166.0
+    read_only: true
+    cap_drop: [ALL]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./infra/local/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:${OTLP_GRPC_HOST_PORT:-4317}:4317" # OTLP/gRPC
+      - "127.0.0.1:${OTLP_HTTP_HOST_PORT:-4318}:4318" # OTLP/HTTP
+    deploy:
+      resources:
+        limits:
+          memory: 512M # the memory_limiter processor sizes itself from this
+    # Distroless image (no shell): no healthcheck, dependants wait for "started".
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    networks: [telemetry]
+
+  jaeger:
+    <<: *hardened
+    image: jaegertracing/jaeger:2.23.0
+    read_only: true
+    cap_drop: [ALL]
+    ports:
+      - "127.0.0.1:${JAEGER_UI_HOST_PORT:-16686}:16686"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:13133/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 1G # in-memory trace storage
+    networks: [telemetry]
+
+  prometheus:
+    <<: *hardened
+    image: prom/prometheus:v3.16.0
+    read_only: true
+    cap_drop: [ALL]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=1GB
+    volumes:
+      - ./infra/local/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks: [telemetry]
+
+networks:
+  edge: {} # clients (agents, operator console) -> gateway
+  upstream:
+    internal: true # gateway <-> MCP servers; no route to the host or the internet
+  data: {} # gateway -> postgres, redis (+ agent-runtime checkpoints in Phase 3)
+  telemetry: {} # every service -> otel-collector -> jaeger / prometheus
+
+volumes:
+  postgres-data: {}
+  redis-data: {}
+  prometheus-data: {}

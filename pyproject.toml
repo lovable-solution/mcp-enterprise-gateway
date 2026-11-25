@@ -1,0 +1,92 @@
+# -----------------------------------------------------------------------------
+# uv workspace root (virtual: not itself an installable package).
+#
+# Every Python service is an independently deployable workspace member that
+# shares one lockfile (uv.lock), one interpreter line (CPython 3.12) and one set
+# of lint / type-check / test settings. Members are added as their phase lands:
+#   Phase 1: gateway (policy schema + engine)
+#   Phase 2: gateway runtime, mcp-servers/crm-ops, libs/platform-telemetry
+#   Phase 3: agent-runtime
+# -----------------------------------------------------------------------------
+[tool.uv]
+required-version = ">=0.9"
+
+[tool.uv.workspace]
+members = ["gateway", "mcp-servers/crm-ops", "libs/platform-telemetry"]
+
+[dependency-groups]
+dev = [
+    "asyncpg-stubs>=0.32",
+    "jsonschema>=4.25",
+    "mypy>=1.18",
+    "pytest>=8.4",
+    "ruff>=0.14",
+    "types-jsonschema>=4.25",
+    "types-python-jose>=3.5",
+    "types-pyyaml>=6.0.12",
+]
+
+# --- Ruff --------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["gateway/src", "gateway/tests", "mcp-servers/crm-ops/src", "mcp-servers/crm-ops/tests", "libs/platform-telemetry/src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "S",             # bandit (security)
+    "SIM", "C4", "PIE", "RET",
+    "PT",            # pytest style
+    "N",             # naming
+    "DTZ",           # timezone-aware datetimes only
+    "T20",           # no stray print()
+    "PL",            # pylint subset
+    "RUF",
+]
+ignore = [
+    "PLR0913",       # many-argument constructors are fine for config models
+]
+# Not selected: flake8-type-checking (TC). Pydantic models and FastAPI route signatures
+# evaluate annotations at runtime; moving those imports under TYPE_CHECKING breaks them.
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "PLR2004", "PLR0917"]  # tests take fixtures positionally
+"**/cli.py" = ["T201"]
+"**/devtools/*.py" = ["T201"]
+"mcp-servers/crm-ops/src/crm_ops/store.py" = ["E501"]  # seed data: one account per line
+"**/errors.py" = ["N818"]  # HTTP problem types read best as Unauthorized, Forbidden, ...
+
+# --- mypy --------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+files = [
+    "conftest.py",
+    "gateway/src/mcp_gateway",
+    "gateway/tests",
+    "mcp-servers/crm-ops/src/crm_ops",
+    "mcp-servers/crm-ops/tests",
+    "libs/platform-telemetry/src/platform_telemetry",
+]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --- pytest ------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["gateway/tests", "mcp-servers/crm-ops/tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
+markers = [
+    "integration: needs the local stack (Postgres + Redis): run `make up` first",
+]
+xfail_strict = true
+filterwarnings = ["error"]

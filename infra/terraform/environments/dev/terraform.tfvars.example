@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars (git-ignored). Contains identifiers only: there are no
+# secrets to put here. Every credential lives in Secrets Manager.
+
+allowed_account_ids = ["111122223333"]
+aws_region          = "us-east-1"
+
+# Networks where agents and operators run; nothing else can reach the ALB.
+alb_ingress_cidrs = ["10.0.0.0/8"]
+certificate_arn   = "arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000"
+
+# Immutable images, pinned by digest (built and pushed by CI).
+gateway_image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/mcp-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+crm_ops_image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/crm-ops-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# Enterprise IdP that issues agent and operator tokens (RS256/ES256 via JWKS).
+jwt_issuer   = "https://idp.example.com/"
+jwt_audience = "mcp-gateway"
+jwt_jwks_url = "https://idp.example.com/.well-known/jwks.json"

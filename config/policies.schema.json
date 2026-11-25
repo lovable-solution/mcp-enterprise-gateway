@@ -1,0 +1,667 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "AccessLevel": {
+      "description": "What a tool does to the world. Role grants are scoped by access level.",
+      "enum": [
+        "read",
+        "write"
+      ],
+      "title": "AccessLevel",
+      "type": "string"
+    },
+    "ApprovalOverride": {
+      "additionalProperties": false,
+      "description": "Per-tool overrides of the global ``approvals`` settings.",
+      "properties": {
+        "approver_roles": {
+          "anyOf": [
+            {
+              "items": {
+                "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                "type": "string"
+              },
+              "minLength": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Roles allowed to decide this tool's approval requests (default:\n``approvals.approver_roles``). Each must hold the ``approvals:decide`` action.",
+          "title": "Approver Roles"
+        },
+        "timeout_seconds": {
+          "anyOf": [
+            {
+              "maximum": 604800,
+              "minimum": 60,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds a request may stay ``PENDING_APPROVAL`` before it becomes ``EXPIRED``\n(default: ``approvals.timeout_seconds``).",
+          "title": "Timeout Seconds"
+        }
+      },
+      "title": "ApprovalOverride",
+      "type": "object"
+    },
+    "ApprovalPolicy": {
+      "additionalProperties": false,
+      "description": "Global human-in-the-loop settings.",
+      "properties": {
+        "approver_roles": {
+          "description": "Default roles allowed to approve or reject. Each must hold ``approvals:decide``.",
+          "items": {
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Approver Roles",
+          "type": "array"
+        },
+        "timeout_seconds": {
+          "default": 900,
+          "description": "Seconds a request may stay ``PENDING_APPROVAL`` before it becomes ``EXPIRED``\n(an expired request is rejected; it never executes).",
+          "maximum": 604800,
+          "minimum": 60,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        },
+        "inline_wait_seconds": {
+          "default": 20,
+          "description": "How long the gateway holds the agent's ``tools/call`` open waiting for a decision.\nIf no decision arrives in time the call returns ``PENDING_APPROVAL`` with the approval\nid, and the agent suspends (checkpoints) until it is decided. Keep this below the load\nbalancer idle timeout.",
+          "maximum": 120,
+          "minimum": 0,
+          "title": "Inline Wait Seconds",
+          "type": "integer"
+        },
+        "require_distinct_approver": {
+          "default": true,
+          "description": "Four-eyes rule: the principal that requested a call can never approve it.",
+          "title": "Require Distinct Approver",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "approver_roles"
+      ],
+      "title": "ApprovalPolicy",
+      "type": "object"
+    },
+    "BudgetOverride": {
+      "additionalProperties": false,
+      "description": "Per-role replacement for individual ``budgets.session`` limits.",
+      "properties": {
+        "max_tool_calls": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Tool Calls"
+        },
+        "max_total_tokens": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Total Tokens"
+        },
+        "max_cost_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Cost Usd"
+        }
+      },
+      "title": "BudgetOverride",
+      "type": "object"
+    },
+    "BudgetPolicy": {
+      "additionalProperties": false,
+      "description": "Per-session budget enforcement (ledgers live in Redis).",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionBudget",
+          "description": "Default limits for every session; roles may override individual limits."
+        },
+        "warn_at_ratio": {
+          "default": 0.8,
+          "description": "Emit a ``budget.warning`` event once any limit reaches this fraction.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Warn At Ratio",
+          "type": "number"
+        },
+        "ledger_ttl_seconds": {
+          "default": 86400,
+          "description": "Idle time after which a session's ledger expires. Must outlive every approval\ntimeout so a ledger cannot expire while a call awaits approval.",
+          "maximum": 2592000,
+          "minimum": 3600,
+          "title": "Ledger Ttl Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "title": "BudgetPolicy",
+      "type": "object"
+    },
+    "CircuitBreakerPolicy": {
+      "additionalProperties": false,
+      "description": "What happens once loop detection trips.",
+      "properties": {
+        "loop_detection": {
+          "$ref": "#/$defs/LoopDetectionPolicy"
+        },
+        "cooldown_seconds": {
+          "default": 300,
+          "description": "How long a tripped breaker blocks every tool call in the session.",
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Cooldown Seconds",
+          "type": "integer"
+        },
+        "require_manual_reset": {
+          "default": false,
+          "description": "Keep a tripped breaker open until an operator resets it, ignoring the cooldown.",
+          "title": "Require Manual Reset",
+          "type": "boolean"
+        }
+      },
+      "title": "CircuitBreakerPolicy",
+      "type": "object"
+    },
+    "ControlAction": {
+      "description": "Control-plane permissions, used by the operator console and its API.",
+      "enum": [
+        "approvals:read",
+        "approvals:decide",
+        "sessions:read",
+        "circuit_breakers:reset",
+        "policy:read"
+      ],
+      "title": "ControlAction",
+      "type": "string"
+    },
+    "LoopDetectionPolicy": {
+      "additionalProperties": false,
+      "description": "Trips the circuit breaker when an agent repeats an identical call.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_identical_calls": {
+          "default": 3,
+          "description": "Identical calls (same session, tool and canonical arguments) allowed within the\nwindow. The next identical call trips the breaker.",
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Max Identical Calls",
+          "type": "integer"
+        },
+        "window_seconds": {
+          "default": 60,
+          "description": "Sliding window over which identical calls are counted.",
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Window Seconds",
+          "type": "integer"
+        }
+      },
+      "title": "LoopDetectionPolicy",
+      "type": "object"
+    },
+    "ModelPrice": {
+      "additionalProperties": false,
+      "description": "USD per million tokens, by token type, as billed by the model provider.",
+      "properties": {
+        "input_per_mtok": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Input Per Mtok"
+        },
+        "output_per_mtok": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Output Per Mtok"
+        },
+        "cache_write_5m_per_mtok": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Prompt-cache writes with the default 5-minute TTL.",
+          "title": "Cache Write 5M Per Mtok"
+        },
+        "cache_write_1h_per_mtok": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Prompt-cache writes with the 1-hour TTL.",
+          "title": "Cache Write 1H Per Mtok"
+        },
+        "cache_read_per_mtok": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Cache Read Per Mtok"
+        }
+      },
+      "required": [
+        "input_per_mtok",
+        "output_per_mtok",
+        "cache_write_5m_per_mtok",
+        "cache_write_1h_per_mtok",
+        "cache_read_per_mtok"
+      ],
+      "title": "ModelPrice",
+      "type": "object"
+    },
+    "PolicyMetadata": {
+      "additionalProperties": false,
+      "description": "Identifies the policy in decision logs, traces and the operator console.",
+      "properties": {
+        "name": {
+          "description": "Identifier recorded with every policy decision (alongside the file digest).",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "PolicyMetadata",
+      "type": "object"
+    },
+    "PricingPolicy": {
+      "additionalProperties": false,
+      "description": "Converts reported token usage into USD for budget enforcement.",
+      "properties": {
+        "currency": {
+          "const": "USD",
+          "default": "USD",
+          "title": "Currency",
+          "type": "string"
+        },
+        "models": {
+          "additionalProperties": false,
+          "description": "Prices keyed by the model id the provider reports in its response.",
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$": {
+              "$ref": "#/$defs/ModelPrice"
+            }
+          },
+          "title": "Models",
+          "type": "object"
+        },
+        "fallback": {
+          "$ref": "#/$defs/ModelPrice",
+          "description": "Applied to usage from any model not listed in ``models``. Must be at least as\nexpensive as every listed model, so an unpriced model can only over-count."
+        }
+      },
+      "required": [
+        "models",
+        "fallback"
+      ],
+      "title": "PricingPolicy",
+      "type": "object"
+    },
+    "RiskTier": {
+      "description": "Business impact if a tool is misused. Surfaced to operators; ``critical`` tools\nmust require approval.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "RiskTier",
+      "type": "string"
+    },
+    "RoleGrant": {
+      "additionalProperties": false,
+      "description": "Allows the tools matched by ``tools`` whose ``access`` is listed in ``access``.",
+      "properties": {
+        "tools": {
+          "description": "Case-sensitive glob patterns over qualified tool names (``*`` and ``?`` only),\ne.g. ``crm-ops__*``. Each pattern must match at least one registered tool.",
+          "items": {
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_*?-]+$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Tools",
+          "type": "array"
+        },
+        "access": {
+          "description": "Access levels covered. A matched tool is allowed only if its access is listed.",
+          "items": {
+            "$ref": "#/$defs/AccessLevel"
+          },
+          "minItems": 1,
+          "title": "Access",
+          "type": "array"
+        }
+      },
+      "required": [
+        "tools",
+        "access"
+      ],
+      "title": "RoleGrant",
+      "type": "object"
+    },
+    "RolePolicy": {
+      "additionalProperties": false,
+      "description": "A role named by the JWT ``role`` claim.",
+      "properties": {
+        "description": {
+          "description": "What the role is for. Shown in the operator console.",
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "inherits": {
+          "default": [],
+          "description": "Roles whose ``allow``, ``deny`` and ``actions`` are merged into this one\n(transitively). Budgets are not inherited.",
+          "items": {
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            "type": "string"
+          },
+          "title": "Inherits",
+          "type": "array"
+        },
+        "allow": {
+          "default": [],
+          "description": "Tool grants (data plane). Nothing is allowed unless a grant matches.",
+          "items": {
+            "$ref": "#/$defs/RoleGrant"
+          },
+          "title": "Allow",
+          "type": "array"
+        },
+        "deny": {
+          "default": [],
+          "description": "Glob patterns that are always denied, overriding every grant (including inherited\nones). Unlike grants, deny patterns may guard tools that are not registered yet.",
+          "items": {
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_*?-]+$",
+            "type": "string"
+          },
+          "title": "Deny",
+          "type": "array"
+        },
+        "actions": {
+          "default": [],
+          "description": "Control-plane actions this role may perform.",
+          "items": {
+            "$ref": "#/$defs/ControlAction"
+          },
+          "title": "Actions",
+          "type": "array"
+        },
+        "budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BudgetOverride"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Overrides individual ``budgets.session`` limits for sessions of this role."
+        }
+      },
+      "required": [
+        "description"
+      ],
+      "title": "RolePolicy",
+      "type": "object"
+    },
+    "SessionBudget": {
+      "additionalProperties": false,
+      "description": "Hard caps for one agent session (JWT ``sid``). Exceeding any one denies further\ntool calls in the session.",
+      "properties": {
+        "max_tool_calls": {
+          "description": "Tool calls forwarded upstream.",
+          "exclusiveMinimum": 0,
+          "title": "Max Tool Calls",
+          "type": "integer"
+        },
+        "max_total_tokens": {
+          "description": "All tokens reported for the session: input, output, cache writes and cache reads.",
+          "exclusiveMinimum": 0,
+          "title": "Max Total Tokens",
+          "type": "integer"
+        },
+        "max_cost_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Token cost (priced via ``pricing``) plus per-call tool costs.",
+          "title": "Max Cost Usd"
+        }
+      },
+      "required": [
+        "max_tool_calls",
+        "max_total_tokens",
+        "max_cost_usd"
+      ],
+      "title": "SessionBudget",
+      "type": "object"
+    },
+    "ToolPolicy": {
+      "additionalProperties": false,
+      "description": "Governance metadata for one upstream tool. Unregistered tools are denied.",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/AccessLevel",
+          "description": "``read`` for side-effect-free tools, ``write`` for anything that changes state.\nThe gateway trusts this classification, never the upstream server's own hints."
+        },
+        "risk": {
+          "$ref": "#/$defs/RiskTier",
+          "default": "low",
+          "description": "Business impact if misused. Shown to operators; ``critical`` requires approval."
+        },
+        "requires_approval": {
+          "default": false,
+          "description": "Suspend every call for a human decision before it reaches the upstream server.",
+          "title": "Requires Approval",
+          "type": "boolean"
+        },
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalOverride"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Approval settings for this tool; only valid when ``requires_approval`` is true."
+        },
+        "cost_usd_per_call": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "0",
+          "description": "Flat USD charged to the session budget each time the call is forwarded upstream\n(e.g. a metered data provider).",
+          "title": "Cost Usd Per Call"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Operator-facing note. Never sent to agents.",
+          "title": "Description"
+        }
+      },
+      "required": [
+        "access"
+      ],
+      "title": "ToolPolicy",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Root of ``policies.yaml``.",
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Bumped only for incompatible changes.",
+      "title": "Version",
+      "type": "integer"
+    },
+    "metadata": {
+      "$ref": "#/$defs/PolicyMetadata"
+    },
+    "roles": {
+      "additionalProperties": false,
+      "description": "Roles, keyed by the value of the JWT ``role`` claim.",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]{0,31}$": {
+          "$ref": "#/$defs/RolePolicy"
+        }
+      },
+      "title": "Roles",
+      "type": "object"
+    },
+    "tools": {
+      "additionalProperties": false,
+      "description": "Registry of every tool the gateway will route, keyed by qualified name\n``<server>__<tool>`` (the name agents see). Anything not listed is denied.",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*__[A-Za-z0-9][A-Za-z0-9_-]*$": {
+          "$ref": "#/$defs/ToolPolicy"
+        }
+      },
+      "propertyNames": {
+        "maxLength": 64
+      },
+      "title": "Tools",
+      "type": "object"
+    },
+    "approvals": {
+      "$ref": "#/$defs/ApprovalPolicy"
+    },
+    "budgets": {
+      "$ref": "#/$defs/BudgetPolicy"
+    },
+    "pricing": {
+      "$ref": "#/$defs/PricingPolicy"
+    },
+    "circuit_breaker": {
+      "$ref": "#/$defs/CircuitBreakerPolicy"
+    }
+  },
+  "required": [
+    "version",
+    "metadata",
+    "roles",
+    "tools",
+    "approvals",
+    "budgets",
+    "pricing"
+  ],
+  "title": "MCP Enterprise Gateway policy (policies.yaml)",
+  "type": "object"
+}

@@ -1,0 +1,148 @@
+# yaml-language-server: $schema=./policies.schema.json
+# =============================================================================
+# MCP Enterprise Gateway: governance policy
+#
+# The gateway loads this file at start-up. Any violation rejects the WHOLE file
+# and the gateway refuses to serve (fail closed). Check it locally with:
+#
+#     make policy-check     # schema + cross-reference validation
+#     make policy-matrix    # effective role x tool / role x action tables
+#
+# Model
+#   * Default deny. A tool that is not registered under `tools` is denied to
+#     every role and never advertised in tools/list.
+#   * Tool names are qualified `<server>__<tool>`, exactly as agents see them.
+#   * Explicit `deny` beats `allow`, including through `inherits`.
+#   * Segregation of duties: a role that can call an approval-gated tool can
+#     never approve it.
+# =============================================================================
+version: 1
+
+metadata:
+  name: enterprise-default
+  description: Reference policy for the crm-ops MCP server.
+
+# -----------------------------------------------------------------------------
+# Roles: matched against the JWT `role` claim.
+#   allow    grants: glob patterns over tool names, scoped by access level
+#   deny     patterns that are always denied (may guard not-yet-registered tools)
+#   actions  control-plane permissions (operator console / API)
+#   budget   per-role override of individual budgets.session limits
+# -----------------------------------------------------------------------------
+roles:
+  analyst:
+    description: Read-only CRM analytics agents.
+    allow:
+      - tools: ["crm-ops__*"]
+        access: [read]
+    budget:
+      max_cost_usd: 2.00
+
+  admin:
+    description: Trusted automation agents that may change CRM state. High-risk changes still need human approval.
+    inherits: [analyst]
+    allow:
+      - tools: ["crm-ops__*"]
+        access: [write]
+    deny:
+      # Destructive verbs stay off-limits to agents on every server, including
+      # tools registered after this policy was written.
+      - "*__delete_*"
+      - "*__purge_*"
+    budget:
+      max_tool_calls: 100
+      max_cost_usd: 10.00
+
+  operator:
+    description: Finance-ops humans working the approval queue. No tool access.
+    actions: [approvals:read, approvals:decide, sessions:read, circuit_breakers:reset, policy:read]
+
+  auditor:
+    description: Compliance reviewers with read-only visibility. No tool access, cannot decide.
+    actions: [approvals:read, sessions:read, policy:read]
+
+# -----------------------------------------------------------------------------
+# Tool registry: every tool the gateway will route. `access` is authoritative:
+# the gateway never trusts an upstream server's own read-only/destructive hints.
+# -----------------------------------------------------------------------------
+tools:
+  crm-ops__search_accounts:
+    access: read
+    risk: low
+    description: Searches the tenant's CRM accounts by name, segment or owner.
+
+  crm-ops__get_account_metrics:
+    access: read
+    risk: low
+    cost_usd_per_call: 0.002 # each call runs a metered warehouse query
+    description: Revenue, receivables ageing and credit utilisation for one account.
+
+  crm-ops__update_credit_limit:
+    access: write
+    risk: high
+    requires_approval: true
+    approval:
+      timeout_seconds: 1800
+    description: Changes an account's credit limit. Financial exposure, so finance ops reviews every call.
+
+# -----------------------------------------------------------------------------
+# Human-in-the-loop
+# -----------------------------------------------------------------------------
+approvals:
+  approver_roles: [operator]
+  timeout_seconds: 900 # PENDING_APPROVAL -> EXPIRED (never executed) after this
+  inline_wait_seconds: 20 # then the call returns PENDING_APPROVAL and the agent checkpoints
+  require_distinct_approver: true # four-eyes: a requester can never approve their own call
+
+# -----------------------------------------------------------------------------
+# Per-session hard caps (session = JWT `sid` claim). Ledgers live in Redis.
+# -----------------------------------------------------------------------------
+budgets:
+  session:
+    max_tool_calls: 50
+    max_total_tokens: 500000 # input + output + cache writes + cache reads
+    max_cost_usd: 5.00 # priced token usage + per-call tool costs
+  warn_at_ratio: 0.8
+  ledger_ttl_seconds: 86400
+
+# -----------------------------------------------------------------------------
+# Token pricing, USD per million tokens: Anthropic first-party API list prices
+# as of 2026-11-03 (cache writes = 1.25x input for the 5-minute TTL, 2x for the
+# 1-hour TTL). Re-check https://platform.claude.com/docs/en/about-claude/pricing
+# before relying on these numbers.
+# -----------------------------------------------------------------------------
+pricing:
+  models:
+    claude-opus-5-5:
+      input_per_mtok: 4.00
+      output_per_mtok: 20.00
+      cache_write_5m_per_mtok: 5.00
+      cache_write_1h_per_mtok: 8.00
+      cache_read_per_mtok: 0.20
+    claude-sonnet-5-5:
+      input_per_mtok: 2.00
+      output_per_mtok: 10.00
+      cache_write_5m_per_mtok: 2.50
+      cache_write_1h_per_mtok: 4.00
+      cache_read_per_mtok: 0.10
+  # Charged for usage from any model not listed above: a provider-side fallback
+  # model, or claude-haiku-5-5, whose long-prompt price tier is not modelled.
+  # Set at the most expensive Claude tier so unknown usage can only over-count.
+  fallback:
+    input_per_mtok: 10.00
+    output_per_mtok: 50.00
+    cache_write_5m_per_mtok: 12.50
+    cache_write_1h_per_mtok: 20.00
+    cache_read_per_mtok: 1.00
+
+# -----------------------------------------------------------------------------
+# Loop detection: the 4th identical call (same session, tool and canonical
+# arguments) within 60 s trips the session's breaker.
+# -----------------------------------------------------------------------------
+circuit_breaker:
+  loop_detection:
+    enabled: true
+    max_identical_calls: 3
+    window_seconds: 60
+  cooldown_seconds: 300
+  require_manual_reset: false
