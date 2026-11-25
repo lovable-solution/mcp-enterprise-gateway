@@ -16,15 +16,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from redis.asyncio import Redis
 
 from ..policy.models import MODEL_ID_REGEX, PricingPolicy, SessionBudget
 from ..telemetry import Attr, tracer
 from .keys import RedisKeys
-from .scripts import BUDGET_CHARGE_TOOL_CALL, BUDGET_RECORD_USAGE
+from .scripts import BUDGET_CHARGE_TOOL_CALL, BUDGET_RECORD_USAGE, BUDGET_REFUND_TOOL_CALL
 
 MICROS_PER_USD: Final = Decimal(1_000_000)
 _MICRO_USD: Final = Decimal("0.000001")
@@ -40,19 +40,47 @@ def micros_to_usd(micros: int) -> Decimal:
     return (Decimal(micros) / MICROS_PER_USD).quantize(_MICRO_USD)
 
 
+class CacheCreation(BaseModel):
+    """Cache writes by TTL, as in Anthropic's ``usage.cache_creation``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ephemeral_5m_input_tokens: int = Field(default=0, ge=0, le=100_000_000)
+    ephemeral_1h_input_tokens: int = Field(default=0, ge=0, le=100_000_000)
+
+
 class UsageReport(BaseModel):
     """One model call's token usage, field-compatible with Anthropic's ``usage`` object."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     model: Annotated[str, StringConstraints(pattern=MODEL_ID_REGEX)]
-    """Model id as reported in the provider's response."""
+    """Model id as reported in the provider's response (with server-side fallbacks, the
+    model that actually answered)."""
     input_tokens: int = Field(ge=0, le=100_000_000)
     output_tokens: int = Field(ge=0, le=100_000_000)
     cache_creation_input_tokens: int = Field(default=0, ge=0, le=100_000_000)
+    """All cache writes; ``cache_creation`` says how many had the (dearer) 1-hour TTL."""
     cache_read_input_tokens: int = Field(default=0, ge=0, le=100_000_000)
-    cache_ttl: Literal["5m", "1h"] = "5m"
-    """TTL of the cache writes in this call (priced differently)."""
+    cache_creation: CacheCreation | None = None
+    """TTL breakdown of ``cache_creation_input_tokens``; without it, every write is priced
+    as a 5-minute write."""
+
+    @model_validator(mode="after")
+    def _check_cache_breakdown(self) -> Self:
+        if (
+            self.cache_creation is not None
+            and self.cache_creation.ephemeral_5m_input_tokens
+            + self.cache_creation.ephemeral_1h_input_tokens
+            > self.cache_creation_input_tokens
+        ):
+            msg = "cache_creation breaks down more tokens than cache_creation_input_tokens"
+            raise ValueError(msg)
+        return self
+
+    @property
+    def cache_write_1h_tokens(self) -> int:
+        return self.cache_creation.ephemeral_1h_input_tokens if self.cache_creation else 0
 
     @property
     def total_tokens(self) -> int:
@@ -72,13 +100,12 @@ class PricedUsage:
 
 def price_usage(report: UsageReport, pricing: PricingPolicy) -> PricedUsage:
     price, fallback = pricing.price_for(report.model)
-    cache_write_rate = (
-        price.cache_write_1h_per_mtok if report.cache_ttl == "1h" else price.cache_write_5m_per_mtok
-    )
+    writes_1h = report.cache_write_1h_tokens
     per_mtok = (
         report.input_tokens * price.input_per_mtok
         + report.output_tokens * price.output_per_mtok
-        + report.cache_creation_input_tokens * cache_write_rate
+        + (report.cache_creation_input_tokens - writes_1h) * price.cache_write_5m_per_mtok
+        + writes_1h * price.cache_write_1h_per_mtok
         + report.cache_read_input_tokens * price.cache_read_per_mtok
     )
     return PricedUsage(cost_usd=per_mtok / Decimal(1_000_000), priced_at_fallback=fallback)
@@ -158,6 +185,7 @@ class BudgetLedger:
         self._keys = keys
         self._charge = redis.register_script(BUDGET_CHARGE_TOOL_CALL)
         self._record = redis.register_script(BUDGET_RECORD_USAGE)
+        self._refund = redis.register_script(BUDGET_REFUND_TOOL_CALL)
 
     async def snapshot(
         self, tenant_id: str, session_id: str, limits: SessionBudget
@@ -192,6 +220,12 @@ class BudgetLedger:
         if status != "ok":
             raise BudgetExceededError(status, snapshot)
         return snapshot
+
+    async def refund_tool_call(self, *, tenant_id: str, session_id: str, cost_usd: Decimal) -> None:
+        """Undo a charge for a call the upstream provably never executed."""
+        await self._refund(
+            keys=[self._keys.budget(tenant_id, session_id)], args=[usd_to_micros(cost_usd)]
+        )
 
     async def record_usage(
         self,

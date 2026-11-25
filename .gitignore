@@ -25,6 +25,7 @@ next-env.d.ts
 
 # --- Terraform (commit .terraform.lock.hcl) --------------------------------------
 .terraform/
+.terraform-plugin-cache/
 *.tfstate
 *.tfstate.*
 *.tfplan
@@ -44,3 +45,6 @@ override.tf.json
 .vscode/*
 !.vscode/extensions.json
 .DS_Store
+
+# Terraform: modules are tested with the environment lock file, copied by make tf-test
+infra/terraform/modules/*/.terraform.lock.hcl

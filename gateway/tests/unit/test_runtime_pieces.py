@@ -1,16 +1,20 @@
 """Pure pieces of the runtime: settings guardrails, fingerprints, webhook signatures,
-budget arithmetic."""
+budget arithmetic, upstream failure classification and approval results."""
 
 from __future__ import annotations
 
 import re
 import time
+import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import httpx2
 import pytest
 from pydantic import ValidationError
 
+from mcp_gateway.approvals.models import Approval, ApprovalStatus
 from mcp_gateway.enforcement.budget import (
     BudgetSnapshot,
     UsageReport,
@@ -20,9 +24,11 @@ from mcp_gateway.enforcement.budget import (
 )
 from mcp_gateway.enforcement.fingerprint import call_fingerprint
 from mcp_gateway.events.webhooks import sign, verify
+from mcp_gateway.pipeline import _approval_result
 from mcp_gateway.policy import load_policy
 from mcp_gateway.policy.models import SessionBudget
 from mcp_gateway.settings import GatewaySettings
+from mcp_gateway.upstream.registry import _never_reached
 
 
 def gateway_settings(**overrides: Any) -> GatewaySettings:
@@ -136,3 +142,81 @@ def test_snapshot_reports_the_first_exhausted_limit() -> None:
     by_calls = BudgetSnapshot.from_ledger({"tool_calls": "5", "cost_micros": "1000000"}, limits)
     assert by_calls.exhausted_limit == "max_tool_calls"
     assert by_calls.utilisation == 1.0
+
+
+# --- upstream failures -------------------------------------------------------------------
+def _caused_by(cause: BaseException) -> BaseException:
+    try:
+        try:
+            raise cause
+        except BaseException as inner:
+            raise RuntimeError("transport failed") from inner
+    except RuntimeError as outer:
+        return outer
+
+
+@pytest.mark.parametrize(
+    ("exc", "never_reached"),
+    [
+        (httpx2.ConnectError("connection refused"), True),
+        (httpx2.ConnectTimeout("connect timed out"), True),
+        (_caused_by(httpx2.ConnectError("refused")), True),
+        (ExceptionGroup("task group", [httpx2.ConnectError("refused")]), True),
+        (ExceptionGroup("outer", [ExceptionGroup("inner", [httpx2.ConnectTimeout("t")])]), True),
+        (httpx2.ReadTimeout("no answer"), False),  # the request was sent: it may have run
+        (httpx2.RemoteProtocolError("connection dropped"), False),
+        (ExceptionGroup("task group", [httpx2.ReadError("reset")]), False),
+        (RuntimeError("anything else"), False),
+    ],
+)
+def test_only_calls_that_never_reached_the_upstream_count_as_not_executed(
+    exc: BaseException, never_reached: bool
+) -> None:
+    assert _never_reached(exc) is never_reached
+
+
+# --- approval results --------------------------------------------------------------------
+def _approval(status: ApprovalStatus, **fields: Any) -> Approval:
+    now = datetime.now(UTC)
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "tenant_id": "acme",
+        "session_id": "s-1",
+        "requester_subject": "agent-7",
+        "requester_role": "admin",
+        "tool_name": "crm-ops__update_credit_limit",
+        "arguments": {"account_id": "ACC-1001", "new_limit_usd": 1},
+        "arguments_digest": "d",
+        "risk": "high",
+        "approver_roles": ("operator",),
+        "status": status,
+        "policy_name": "p",
+        "policy_digest": "x",
+        "policy_rule": "r",
+        "trace_id": None,
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=30),
+    }
+    return Approval(**(base | fields))
+
+
+@pytest.mark.parametrize("status", [ApprovalStatus.APPROVED, ApprovalStatus.EXECUTING])
+def test_an_approved_call_in_flight_is_reported_as_running_not_awaiting_review(
+    status: ApprovalStatus,
+) -> None:
+    result, _ = _approval_result(_approval(status))
+    meta = (result.meta or {})["mcp-enterprise-gateway/governance"]
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert (meta["code"], meta["status"]) == ("PENDING_APPROVAL", status.value)
+    assert "approved and is being executed" in text
+    assert "Do not retry" in text
+    assert "held for human approval" not in text
+
+
+def test_a_failed_execution_reports_the_error() -> None:
+    result, _ = _approval_result(
+        _approval(ApprovalStatus.FAILED, error="crm-ops unreachable", decided_by_subject="ops")
+    )
+    meta = (result.meta or {})["mcp-enterprise-gateway/governance"]
+    assert meta["code"] == "APPROVAL_FAILED"
+    assert meta["error"] == "crm-ops unreachable"

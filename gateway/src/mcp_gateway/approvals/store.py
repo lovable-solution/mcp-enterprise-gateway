@@ -153,7 +153,7 @@ class ApprovalStore:
         """Compare-and-set ``expected -> target``; None if the row was not in ``expected``
         (or, with ``unexpired_only``, had already passed its expiry)."""
         params: list[Any] = [approval_id, expected.value, target.value]
-        assignments = ["status = $3"]
+        assignments = ["status = $3", "status_changed_at = now()"]
 
         def bind(column: str, value: Any) -> None:
             params.append(value)
@@ -196,7 +196,7 @@ class ApprovalStore:
         async with self._pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
                 """
-                UPDATE approval_requests SET status = 'EXPIRED'
+                UPDATE approval_requests SET status = 'EXPIRED', status_changed_at = now()
                 WHERE status = 'PENDING_APPROVAL' AND expires_at <= now()
                 RETURNING *
                 """
@@ -210,6 +210,23 @@ class ApprovalStore:
                     actor=SYSTEM_ACTOR,
                     detail={"reason": "no decision before expires_at"},
                 )
+        return [_approval(row) for row in rows]
+
+    async def stalled(
+        self, status: ApprovalStatus, *, older_than_seconds: float, limit: int = 100
+    ) -> list[Approval]:
+        """Rows that have sat in ``status`` (APPROVED or EXECUTING) for too long."""
+        rows = await self._pool.fetch(
+            """
+            SELECT * FROM approval_requests
+            WHERE status = $1 AND status_changed_at < now() - make_interval(secs => $2)
+            ORDER BY status_changed_at
+            LIMIT $3
+            """,
+            status.value,
+            older_than_seconds,
+            limit,
+        )
         return [_approval(row) for row in rows]
 
     async def audit_trail(self, approval_id: UUID) -> list[AuditEntry]:

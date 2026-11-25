@@ -97,7 +97,7 @@ async def test_pause_approve_resume_inline(
         assert row["status"] == "PENDING_APPROVAL"
         assert row["arguments"] == arguments
         assert row["requester_subject"] == "automation-bot"
-        assert list(row["approver_roles"]) == ["operator"]
+        assert list(row["approver_roles"]) == ["operator", "decider"]
         assert crm_ops.store.credit_limit("acme", "ACC-1005") == limit_before
         assert "result" not in outcome  # the agent's call is still held
         requested = webhook(webhook_receiver, "approval.requested", approval_id)
@@ -141,7 +141,13 @@ async def test_pause_approve_resume_inline(
     types = [
         e["type"] for e in await stream_events() if e["data"].get("approval_id") == approval_id
     ]
-    assert types == ["approval.requested", "approval.approved", "approval.executed"]
+    # The approved call's spend is reported like any other call's.
+    assert types == [
+        "approval.requested",
+        "approval.approved",
+        "approval.executed",
+        "session.activity",
+    ]
 
 
 async def test_pause_checkpoint_then_resume_after_inline_wait(
@@ -386,3 +392,91 @@ async def test_database_enforces_the_approval_invariants(
         )
     with pytest.raises(asyncpg.InsufficientPrivilegeError, match="append-only"):
         await gateway_db.execute("DELETE FROM approval_audit WHERE approval_id = $1", approval_id)
+
+
+async def test_a_decide_only_approver_sees_the_outcome_of_its_decision(
+    mcp_client: Any, mint: Any, api: Any, auth: Any, crm_ops: Any
+) -> None:
+    async with mcp_client(mint("admin", sid=new_sid())) as client:
+        held = await client.call_tool(
+            UPDATE,
+            {"account_id": "ACC-1003", "new_limit_usd": 80_000, "reason": "small uplift"},
+        )
+    approval_id = governance(held)["approval_id"]
+    decider = mint("decider", sub="desk-grace", sid=None)
+    assert (await api.get(f"/v1/approvals/{approval_id}", headers=auth(decider))).status_code == 403
+
+    decided = await api.post(
+        f"/v1/approvals/{approval_id}/decide", json={"decision": "approve"}, headers=auth(decider)
+    )
+    assert decided.status_code == 200, decided.text
+    assert decided.json()["status"] == "EXECUTED"
+    assert crm_ops.store.credit_limit("acme", "ACC-1003") == 80_000
+
+
+async def wait_for_status(db: Any, approval_id: UUID, status: str, timeout: float = 10) -> Any:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row = await db.fetchrow("SELECT * FROM approval_requests WHERE id = $1", approval_id)
+        if row["status"] == status:
+            return row
+        await anyio.sleep(0.1)
+    pytest.fail(f"approval {approval_id} never reached {status} (last: {row['status']})")
+
+
+async def held_call(mcp_client: Any, mint: Any, arguments: dict[str, Any]) -> UUID:
+    async with mcp_client(mint("admin", sub="recovery-bot", sid=new_sid())) as client:
+        held = await client.call_tool(UPDATE, arguments)
+    assert governance(held)["code"] == "PENDING_APPROVAL"
+    return UUID(governance(held)["approval_id"])
+
+
+async def test_an_approved_call_a_crashed_replica_never_started_is_executed(
+    mcp_client: Any, mint: Any, gateway_db: Any, crm_ops: Any
+) -> None:
+    approval_id = await held_call(
+        mcp_client,
+        mint,
+        {"account_id": "ACC-1002", "new_limit_usd": 275_000, "reason": "crash after approve"},
+    )
+    # A replica committed the decision, then died before claiming the call.
+    await gateway_db.execute(
+        "UPDATE approval_requests SET status = 'APPROVED', decided_at = now(), "
+        "decided_by_subject = 'ops-heidi', decided_by_role = 'operator', "
+        "status_changed_at = now() - interval '10 minutes' WHERE id = $1",
+        approval_id,
+    )
+    row = await wait_for_status(gateway_db, approval_id, "EXECUTED")
+    assert row["result"]["structuredContent"]["new_limit_usd"] == 275_000
+    assert crm_ops.store.credit_limit("acme", "ACC-1002") == 275_000
+
+
+async def test_an_interrupted_execution_is_failed_and_never_rerun(
+    mcp_client: Any, mint: Any, gateway_db: Any, crm_ops: Any, stream_events: Any
+) -> None:
+    approval_id = await held_call(
+        mcp_client,
+        mint,
+        {"account_id": "ACC-1001", "new_limit_usd": 777_000, "reason": "crash mid-call"},
+    )
+    changes_before = len(crm_ops.store.changes)
+    # A replica claimed the call and died mid-flight: the outcome is unknown.
+    async with gateway_db.transaction():
+        await gateway_db.execute(
+            "UPDATE approval_requests SET status = 'APPROVED', decided_at = now(), "
+            "decided_by_subject = 'ops-ivan', decided_by_role = 'operator' WHERE id = $1",
+            approval_id,
+        )
+        await gateway_db.execute(
+            "UPDATE approval_requests SET status = 'EXECUTING', "
+            "status_changed_at = now() - interval '1 hour' WHERE id = $1",
+            approval_id,
+        )
+    row = await wait_for_status(gateway_db, approval_id, "FAILED")
+    assert "interrupted" in row["error"]
+    assert "verify the upstream state" in row["error"]
+    assert len(crm_ops.store.changes) == changes_before  # not retried: it may have run
+    assert any(
+        e["type"] == "approval.failed" and e["data"]["approval_id"] == str(approval_id)
+        for e in await stream_events()
+    )

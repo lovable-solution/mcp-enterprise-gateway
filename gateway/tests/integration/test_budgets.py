@@ -76,15 +76,30 @@ async def test_every_token_type_is_priced_exactly(mint: Any, api: Any) -> None:
             model="claude-sonnet-5-5",
             input_tokens=1_234,
             output_tokens=567,
-            cache_creation_input_tokens=1_000,
+            cache_creation_input_tokens=1_500,
             cache_read_input_tokens=20_000,
-            cache_ttl="1h",
+            cache_creation={"ephemeral_5m_input_tokens": 500, "ephemeral_1h_input_tokens": 1_000},
         )
     ).json()
-    # (1234 x 2 + 567 x 10 + 1000 x 4 [1h cache write] + 20000 x 0.10) / 1M
-    assert Decimal(body["cost_usd"]) == Decimal("0.014138")
+    # (1234 x 2 + 567 x 10 + 500 x 2.50 [5m write] + 1000 x 4 [1h write] + 20000 x 0.10) / 1M
+    assert Decimal(body["cost_usd"]) == Decimal("0.015388")
     assert body["priced_at_fallback"] is False
-    assert body["budget"]["total_tokens"] == 22_801
+    assert body["budget"]["total_tokens"] == 23_301
+
+
+async def test_a_cache_breakdown_larger_than_the_total_is_refused(mint: Any, api: Any) -> None:
+    sid = new_sid()
+    response = await report(
+        api,
+        mint("analyst", sid=sid),
+        sid,
+        model="claude-sonnet-5-5",
+        input_tokens=1,
+        output_tokens=1,
+        cache_creation_input_tokens=10,
+        cache_creation={"ephemeral_1h_input_tokens": 11},
+    )
+    assert response.status_code == 422
 
 
 async def test_unpriced_models_are_charged_the_conservative_fallback(mint: Any, api: Any) -> None:
@@ -101,6 +116,22 @@ async def test_unpriced_models_are_charged_the_conservative_fallback(mint: Any, 
     ).json()
     assert body["priced_at_fallback"] is True
     assert Decimal(body["cost_usd"]) == Decimal("0.01")  # fallback $10 / M input
+
+
+async def test_unpriced_model_ids_never_become_metric_labels(
+    mint: Any, api: Any, telemetry: Any
+) -> None:
+    """The model id is caller-supplied: as a label it would let an agent mint unbounded
+    metric series, so every unknown id is folded into one."""
+    for n in range(3):
+        sid = new_sid()
+        await report(api, mint("analyst", sid=sid), sid, model=f"made-up-{n}", input_tokens=10)
+    labels = {
+        attrs.get("gen_ai.request.model")
+        for attrs, _ in telemetry.metric_points("mcp_gateway.tokens")
+    }
+    assert not any(str(label).startswith("made-up-") for label in labels)
+    assert "(unpriced)" in labels
 
 
 async def test_metered_tools_charge_their_cost(

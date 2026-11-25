@@ -6,13 +6,13 @@
 # of lint / type-check / test settings. Members are added as their phase lands:
 #   Phase 1: gateway (policy schema + engine)
 #   Phase 2: gateway runtime, mcp-servers/crm-ops, libs/platform-telemetry
-#   Phase 3: agent-runtime
+#   Phase 3: agent-runtime (LangGraph + PydanticAI)
 # -----------------------------------------------------------------------------
 [tool.uv]
 required-version = ">=0.9"
 
 [tool.uv.workspace]
-members = ["gateway", "mcp-servers/crm-ops", "libs/platform-telemetry"]
+members = ["gateway", "mcp-servers/crm-ops", "libs/platform-telemetry", "agent-runtime"]
 
 [dependency-groups]
 dev = [
@@ -30,7 +30,7 @@ dev = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["gateway/src", "gateway/tests", "mcp-servers/crm-ops/src", "mcp-servers/crm-ops/tests", "libs/platform-telemetry/src"]
+src = ["gateway/src", "gateway/tests", "mcp-servers/crm-ops/src", "mcp-servers/crm-ops/tests", "libs/platform-telemetry/src", "agent-runtime/src", "agent-runtime/tests"]
 
 [tool.ruff.lint]
 select = [
@@ -73,6 +73,8 @@ files = [
     "mcp-servers/crm-ops/src/crm_ops",
     "mcp-servers/crm-ops/tests",
     "libs/platform-telemetry/src/platform_telemetry",
+    "agent-runtime/src/agent_runtime",
+    "agent-runtime/tests",
 ]
 
 [tool.pydantic-mypy]
@@ -83,10 +85,11 @@ warn_required_dynamic_aliases = true
 # --- pytest ------------------------------------------------------------------
 [tool.pytest.ini_options]
 minversion = "8.0"
-testpaths = ["gateway/tests", "mcp-servers/crm-ops/tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
+testpaths = ["gateway/tests", "mcp-servers/crm-ops/tests", "agent-runtime/tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib", "-m", "not live"]
 markers = [
     "integration: needs the local stack (Postgres + Redis): run `make up` first",
+    "live: calls the real Claude API (costs money): opt in with `make test-live`",
 ]
 xfail_strict = true
 filterwarnings = ["error"]

@@ -13,14 +13,14 @@
 Blocked calls return a ``CallToolResult`` with ``is_error=True``, a message the model can
 act on, and a machine-readable ``_meta["mcp-enterprise-gateway/governance"]`` entry
 (``code``: PENDING_APPROVAL, REJECTED, EXPIRED, APPROVAL_FAILED, CIRCUIT_OPEN,
-BUDGET_EXCEEDED, INVALID_ARGUMENTS, UPSTREAM_UNAVAILABLE) that agent runtimes act on.
+BUDGET_EXCEEDED, INVALID_ARGUMENTS, UPSTREAM_UNAVAILABLE, OUTCOME_UNKNOWN) that agent
+runtimes act on. A call the upstream provably never ran is refunded to the session budget.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from decimal import Decimal
 from typing import Any, Final
 
 from mcp import MCPError
@@ -34,6 +34,7 @@ from .enforcement.breaker import BreakerState, BreakerVerdict, CircuitBreaker
 from .enforcement.budget import BudgetExceededError, BudgetLedger, BudgetSnapshot
 from .enforcement.fingerprint import call_fingerprint
 from .enforcement.sessions import SessionDirectory
+from .enforcement.spend import SpendEvents, budget_data
 from .events.notifier import Notifier
 from .policy.engine import PolicyEngine, ToolDecision
 from .policy.loader import LoadedPolicy
@@ -72,6 +73,7 @@ class ToolCallPipeline:
         sessions: SessionDirectory,
         approvals: ApprovalService,
         notifier: Notifier,
+        spend: SpendEvents,
         instruments: Instruments,
     ) -> None:
         self._policy = policy
@@ -82,6 +84,7 @@ class ToolCallPipeline:
         self._sessions = sessions
         self._approvals = approvals
         self._notifier = notifier
+        self._spend = spend
         self._instruments = instruments
 
     async def list_tools(self, principal: Principal) -> list[Tool]:
@@ -111,10 +114,13 @@ class ToolCallPipeline:
                 Attr.POLICY_DIGEST: self._policy.digest,
             }
         )
-        outcome = Outcome.DENIED
+        outcome = Outcome.ERROR
         try:
             result, outcome = await self._enforce(principal, name, arguments, progress)
             return result
+        except MCPError:
+            outcome = Outcome.DENIED  # the only protocol error raised here is the RBAC denial
+            raise
         finally:
             labels = {
                 Attr.TOOL: name if name in self._policy.document.tools else "(unregistered)",
@@ -240,21 +246,41 @@ class ToolCallPipeline:
             )
         except BudgetExceededError as exc:
             return await self._budget_exceeded(principal, exc.limit, exc.snapshot)
-        self._record_tool_cost(principal, name, spec.cost_usd_per_call)
+        self._spend.record_tool_cost(tenant_id=tenant, tool=name, cost_usd=spec.cost_usd_per_call)
         try:
             with tracer.start_as_current_span(
                 "gateway.upstream.call", attributes={Attr.UPSTREAM: entry.server}
             ):
                 result = await self._registry.call(entry, CallerIdentity.of(principal), arguments)
-        except UpstreamError:
+        except UpstreamError as exc:
+            if exc.executed == "no":  # never ran: give the session its call back
+                await self._budget.refund_tool_call(
+                    tenant_id=tenant, session_id=session, cost_usd=spec.cost_usd_per_call
+                )
+                return (
+                    governance_result(
+                        "UPSTREAM_UNAVAILABLE",
+                        f"The server providing {name} is unreachable; the call did not run. "
+                        "Try again later.",
+                    ),
+                    Outcome.UPSTREAM_UNAVAILABLE,
+                )
             return (
                 governance_result(
-                    "UPSTREAM_UNAVAILABLE",
-                    f"The server providing {name} could not complete the call. Try again later.",
+                    "OUTCOME_UNKNOWN",
+                    f"The server providing {name} failed while handling the call. It may or "
+                    "may not have taken effect: check before repeating it.",
                 ),
                 Outcome.UPSTREAM_UNAVAILABLE,
             )
-        await self.after_spend(principal, snapshot, tool=name)
+        await self._spend.after_spend(
+            tenant_id=tenant,
+            session_id=session,
+            subject=principal.subject,
+            role=principal.role,
+            snapshot=snapshot,
+            tool=name,
+        )
         return result, (Outcome.TOOL_ERROR if result.is_error else Outcome.SUCCEEDED)
 
     async def _deny(self, principal: Principal, name: str, decision: ToolDecision) -> None:
@@ -319,80 +345,23 @@ class ToolCallPipeline:
             1, {Attr.BUDGET_LIMIT: limit, Attr.ROLE: principal.role}
         )
         assert principal.session_id is not None  # noqa: S101
-        if await self._budget.first_time(principal.tenant_id, principal.session_id, "exhausted"):
-            await self._notifier.emit(
-                "budget.exhausted",
-                tenant_id=principal.tenant_id,
-                session_id=principal.session_id,
-                data={
-                    "limit": limit,
-                    "subject": principal.subject,
-                    "budget": _budget_data(snapshot),
-                },
-            )
+        await self._spend.exhausted(
+            tenant_id=principal.tenant_id,
+            session_id=principal.session_id,
+            subject=principal.subject,
+            limit=limit,
+            snapshot=snapshot,
+        )
         return (
             governance_result(
                 "BUDGET_EXCEEDED",
                 f"Blocked: this session has reached its {limit} budget limit. No further tool "
                 "calls are allowed in this session.",
                 limit=limit,
-                budget=_budget_data(snapshot),
+                budget=budget_data(snapshot),
             ),
             Outcome.BUDGET_EXCEEDED,
         )
-
-    def _record_tool_cost(self, principal: Principal, tool: str, cost: Decimal) -> None:
-        if cost > 0:
-            self._instruments.cost_usd.add(
-                float(cost),
-                {Attr.COST_SOURCE: "tool", Attr.TOOL: tool, Attr.TENANT: principal.tenant_id},
-            )
-
-    async def after_spend(
-        self, principal: Principal, snapshot: BudgetSnapshot, **context: Any
-    ) -> None:
-        """Emit live-activity, warning and exhaustion events after a ledger change."""
-        assert principal.session_id is not None  # noqa: S101
-        tenant, session = principal.tenant_id, principal.session_id
-        budget = _budget_data(snapshot)
-        await self._notifier.emit(
-            "session.activity",
-            tenant_id=tenant,
-            session_id=session,
-            data={
-                "subject": principal.subject,
-                "role": principal.role,
-                "budget": budget,
-                **context,
-            },
-        )
-        warn_at = self._policy.document.budgets.warn_at_ratio
-        if snapshot.utilisation >= warn_at and await self._budget.first_time(
-            tenant, session, "warned"
-        ):
-            await self._notifier.emit(
-                "budget.warning",
-                tenant_id=tenant,
-                session_id=session,
-                data={"subject": principal.subject, "warn_at_ratio": warn_at, "budget": budget},
-            )
-        if snapshot.exhausted_limit is not None and await self._budget.first_time(
-            tenant, session, "exhausted"
-        ):
-            await self._notifier.emit(
-                "budget.exhausted",
-                tenant_id=tenant,
-                session_id=session,
-                data={
-                    "subject": principal.subject,
-                    "limit": snapshot.exhausted_limit,
-                    "budget": budget,
-                },
-            )
-
-
-def _budget_data(snapshot: BudgetSnapshot) -> dict[str, Any]:
-    return snapshot.model_dump(mode="json") | {"utilisation": round(snapshot.utilisation, 4)}
 
 
 def _circuit_open(verdict: BreakerVerdict) -> CallToolResult:
@@ -452,6 +421,16 @@ def _approval_result(approval: Approval) -> tuple[CallToolResult, Outcome]:
                     **details,
                 ),
                 Outcome.APPROVAL_FAILED,
+            )
+        case ApprovalStatus.APPROVED | ApprovalStatus.EXECUTING:
+            return (
+                governance_result(
+                    "PENDING_APPROVAL",
+                    f"This call was approved and is being executed (approval id {approval.id}). "
+                    "Do not retry it: its result becomes available under that approval id.",
+                    **details,
+                ),
+                Outcome.PENDING_APPROVAL,
             )
         case _:
             return (

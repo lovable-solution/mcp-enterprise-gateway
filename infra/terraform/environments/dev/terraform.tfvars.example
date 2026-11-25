@@ -8,11 +8,24 @@ aws_region          = "us-east-1"
 alb_ingress_cidrs = ["10.0.0.0/8"]
 certificate_arn   = "arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000"
 
+# Name the certificate covers; with private_zone_id, Terraform creates the record in
+# a private hosted zone associated with the VPC (needed by the in-VPC agent task).
+gateway_hostname = "gateway.example.internal"
+private_zone_id  = "Z0123456789ABCDEFGHIJ"
+
 # Immutable images, pinned by digest (built and pushed by CI).
-gateway_image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/mcp-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-crm_ops_image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/crm-ops-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+gateway_image       = "111122223333.dkr.ecr.us-east-1.amazonaws.com/mcp-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+crm_ops_image       = "111122223333.dkr.ecr.us-east-1.amazonaws.com/crm-ops-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+operator_ui_image   = "111122223333.dkr.ecr.us-east-1.amazonaws.com/operator-ui@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+agent_runtime_image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/agent-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# Mirror public images into ECR (or pin public.ecr.aws digests).
+db_bootstrap_image   = "111122223333.dkr.ecr.us-east-1.amazonaws.com/postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+otel_collector_image = "public.ecr.aws/aws-observability/aws-otel-collector@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 # Enterprise IdP that issues agent and operator tokens (RS256/ES256 via JWKS).
 jwt_issuer   = "https://idp.example.com/"
 jwt_audience = "mcp-gateway"
 jwt_jwks_url = "https://idp.example.com/.well-known/jwks.json"
+
+# Optional: signed approval webhooks (e.g. a chat bridge).
+# approval_webhook_url = "https://hooks.example.internal/mcp-gateway"

@@ -1,32 +1,34 @@
-# Output contract. Values are null placeholders until Phase 4 implements the
-# resources; names and meanings are fixed so callers can be wired now.
-
 output "vpc_id" {
   description = "ID of the VPC."
-  value       = null # Phase 4: aws_vpc.this.id
+  value       = aws_vpc.this.id
 }
 
 output "vpc_cidr_block" {
   description = "IPv4 CIDR of the VPC."
-  value       = var.cidr_block
+  value       = aws_vpc.this.cidr_block
 }
 
 output "availability_zones" {
   description = "AZs the subnets are spread across."
-  value       = null # Phase 4: data.aws_availability_zones.available.names, first az_count
+  value       = local.azs
 }
 
 output "public_subnet_ids" {
   description = "Public subnets (NAT gateways; ALB only when internet-facing)."
-  value       = null # Phase 4: aws_subnet.public[*].id
+  value       = [for az in local.azs : aws_subnet.public[az].id]
 }
 
 output "private_app_subnet_ids" {
   description = "Private subnets for ECS tasks and the internal ALB."
-  value       = null # Phase 4: aws_subnet.private_app[*].id
+  value       = [for az in local.azs : aws_subnet.private_app[az].id]
 }
 
 output "private_data_subnet_ids" {
   description = "Isolated subnets for RDS and ElastiCache (no internet route)."
-  value       = null # Phase 4: aws_subnet.private_data[*].id
+  value       = [for az in local.azs : aws_subnet.private_data[az].id]
+}
+
+output "nat_public_ips" {
+  description = "Egress IPs of the NAT gateways (allow-list these at third parties such as the IdP)."
+  value       = [for az in local.nat_azs : aws_eip.nat[az].public_ip]
 }

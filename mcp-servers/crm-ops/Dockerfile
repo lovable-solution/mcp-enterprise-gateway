@@ -16,6 +16,7 @@ COPY pyproject.toml uv.lock ./
 COPY gateway/pyproject.toml gateway/
 COPY mcp-servers/crm-ops/pyproject.toml mcp-servers/crm-ops/
 COPY libs/platform-telemetry/pyproject.toml libs/platform-telemetry/
+COPY agent-runtime/pyproject.toml agent-runtime/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --package crm-ops-mcp --no-install-workspace
 

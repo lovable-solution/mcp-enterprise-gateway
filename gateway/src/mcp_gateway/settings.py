@@ -118,6 +118,12 @@ class GatewaySettings(BaseSettings):
     event_stream_maxlen: int = Field(default=10_000, ge=100)
     sse_keepalive_seconds: float = Field(default=15.0, gt=0, le=120)
     approval_sweep_interval_seconds: float = Field(default=5.0, gt=0, le=300)
+    approval_stalled_after_seconds: float = Field(default=30.0, gt=0)
+    """An APPROVED call not started within this time (its replica died) is executed by the
+    recovery sweeper; it never ran, so this is safe."""
+    approval_interrupted_after_seconds: float = Field(default=180.0, gt=0)
+    """An EXECUTING call older than this was interrupted mid-call; it is marked FAILED with
+    an unknown outcome. Must comfortably exceed upstream_timeout_seconds."""
 
     @field_validator("upstreams")
     @classmethod
@@ -161,6 +167,12 @@ class GatewaySettings(BaseSettings):
                 raise ValueError(msg)
         elif self.jwt_jwks_url is None:
             msg = "asymmetric JWT algorithms need GATEWAY_JWT_JWKS_URL"
+            raise ValueError(msg)
+        if self.approval_interrupted_after_seconds <= self.upstream_timeout_seconds * 2:
+            msg = (
+                "GATEWAY_APPROVAL_INTERRUPTED_AFTER_SECONDS must exceed twice "
+                "GATEWAY_UPSTREAM_TIMEOUT_SECONDS, or live calls could be declared interrupted"
+            )
             raise ValueError(msg)
         if self.webhook_url and self.webhook_hmac_key is None:
             msg = "GATEWAY_WEBHOOK_URL needs GATEWAY_WEBHOOK_HMAC_KEY (deliveries are signed)"

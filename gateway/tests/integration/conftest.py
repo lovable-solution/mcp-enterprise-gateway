@@ -223,7 +223,8 @@ def webhook_receiver() -> Iterator[WebhookReceiver]:
 
 
 def _test_policy(path: Path) -> Path:
-    """The shipped policy, plus a role with a tiny budget and a short inline wait."""
+    """The shipped policy, plus test roles (a tiny budget; decide-only) and a short inline
+    wait."""
     data = yaml.safe_load((REPO_ROOT / "config" / "policies.yaml").read_text(encoding="utf-8"))
     data["approvals"]["inline_wait_seconds"] = INLINE_WAIT_SECONDS
     data["roles"]["capped"] = {
@@ -231,6 +232,11 @@ def _test_policy(path: Path) -> Path:
         "inherits": ["analyst"],
         "budget": {"max_tool_calls": 2},
     }
+    data["roles"]["decider"] = {
+        "description": "May decide approvals but not list or read them (tests).",
+        "actions": ["approvals:decide"],
+    }
+    data["approvals"]["approver_roles"] = ["operator", "decider"]
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return path
 

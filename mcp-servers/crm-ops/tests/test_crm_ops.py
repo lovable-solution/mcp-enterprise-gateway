@@ -16,8 +16,10 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp_types import CallToolResult, TextContent
 from pydantic import SecretStr
 
+from crm_ops.models import AccountStatus, Segment
 from crm_ops.server import CrmOpsApp, create_app
 from crm_ops.settings import CrmOpsSettings
+from crm_ops.store import Account, CrmStore
 
 pytestmark = pytest.mark.anyio
 
@@ -195,3 +197,22 @@ async def test_tenantless_identity_cannot_use_tools(connect: Connect) -> None:
         result = await client.call_tool("search_accounts", {"query": "a"})
     assert result.is_error
     assert "carries no tenant" in text(result)
+
+
+def test_metrics_of_an_account_without_revenue_report_zero_dso() -> None:
+    account = Account(
+        tenant_id="acme",
+        account_id="ACC-9001",
+        name="Newco",
+        segment=Segment.SMB,
+        industry="software",
+        owner="m.chen",
+        status=AccountStatus.ACTIVE,
+        credit_limit_usd=10_000,
+        annual_revenue_usd=0,
+        ageing=(1_000, 0, 0, 0, 0),
+        risk_rating="medium",
+    )
+    metrics = CrmStore([account]).metrics("acme", "ACC-9001")
+    assert metrics.days_sales_outstanding == 0
+    assert metrics.open_receivables_usd == 1_000

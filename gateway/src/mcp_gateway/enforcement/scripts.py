@@ -94,3 +94,19 @@ redis.call('EXPIRE', KEYS[1], tonumber(ARGV[6]))
 local calls = tonumber(redis.call('HGET', KEYS[1], 'tool_calls') or '0')
 return {calls, tokens, cost}
 """
+
+# KEYS: budget hash; ARGV: call_cost_micros
+# Undoes one charge_tool_call for a call the upstream provably never ran (each counter is
+# floored at zero, so a refund can never mint budget). Returns the new tool_calls.
+BUDGET_REFUND_TOOL_CALL: Final = """
+local function sub(field, amount)
+  local current = tonumber(redis.call('HGET', KEYS[1], field) or '0')
+  local value = math.max(0, current - amount)
+  redis.call('HSET', KEYS[1], field, value)
+  return value
+end
+local calls = sub('tool_calls', 1)
+sub('cost_micros', tonumber(ARGV[1]))
+sub('tool_cost_micros', tonumber(ARGV[1]))
+return calls
+"""

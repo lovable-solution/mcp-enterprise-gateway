@@ -1,13 +1,33 @@
-# operator-ui (Phase 3)
+# operator-ui
 
-Operator console (Next.js 15, TypeScript, Tailwind): active agent sessions, live
-token and cost burn, circuit-breaker alerts, and the approval queue (one-click
-approve/reject with JSON payload inspection).
+The operator console: the approval queue with one-click approve or reject and the exact
+JSON payload, live per-session token and cost burn, circuit-breaker and budget alerts,
+and a live event feed. It is built with Next.js 15 (App Router), TypeScript and
+Tailwind CSS v4.
 
-Contract:
+It is a backend-for-frontend:
+- the browser talks only to this app;
+- route handlers under `src/app/api` call the gateway with the operator's token;
+- that token lives in an encrypted, httpOnly, SameSite=Strict cookie.
 
-- Talks only to the gateway's control-plane API, authenticated as a human operator.
-  What each user can see or do comes from `actions` in `config/policies.yaml`
-  (`approvals:read`, `approvals:decide`, `sessions:read`, `circuit_breakers:reset`,
-  `policy:read`).
-- Live updates arrive over the gateway's server-sent event stream.
+```bash
+pnpm install --frozen-lockfile
+pnpm check      # ESLint, TypeScript, Vitest
+pnpm build      # standalone server in .next/standalone
+make ui-dev     # from the repository root: hot reload against the local gateway
+```
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GATEWAY_URL` | `http://localhost:8000` | the gateway's control-plane API (server-side only) |
+| `SESSION_SECRET` | required, at least 32 characters | encrypts the session cookie |
+| `DEV_SIGNIN` | `false` | local stack only: sign in by minting tokens with `GATEWAY_JWT_SECRET` |
+| `GATEWAY_JWT_SECRET`, `GATEWAY_JWT_ISSUER`, `GATEWAY_JWT_AUDIENCE` | -, `http://localhost/dev-idp`, `mcp-gateway` | development token minting |
+| `CONSOLE_TENANT` | `acme` | tenant of development sign-ins |
+| `COOKIE_SECURE` | `true` in production | set `false` only for plain-HTTP localhost |
+
+With `DEV_SIGNIN=false` the console accepts tokens issued by the identity provider. They
+must carry an `operator` or `auditor` role, and they are checked against the gateway
+before a session starts.

@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 import asyncpg
 import httpx2
 from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-from redis.asyncio import Redis
+from redis.asyncio import BlockingConnectionPool, Redis
+from redis.asyncio.connection import Connection, SSLConnection
 
 from platform_telemetry import Telemetry, configure_telemetry
 
@@ -29,7 +30,9 @@ from .enforcement.breaker import CircuitBreaker
 from .enforcement.budget import BudgetLedger
 from .enforcement.keys import RedisKeys
 from .enforcement.sessions import SessionDirectory
+from .enforcement.spend import SpendEvents
 from .events.bus import EventBus
+from .events.hub import EventHub
 from .events.notifier import Notifier
 from .events.webhooks import WebhookDispatcher
 from .pipeline import ToolCallPipeline
@@ -58,7 +61,9 @@ class GatewayRuntime:
     redis: Redis
     db: asyncpg.Pool
     bus: EventBus
+    hub: EventHub
     notifier: Notifier
+    spend: SpendEvents
     breaker: CircuitBreaker
     budget: BudgetLedger
     sessions: SessionDirectory
@@ -83,18 +88,21 @@ class GatewayRuntime:
         engine = PolicyEngine(policy.document)
         instruments = Instruments.create()
         http = httpx2.AsyncClient(timeout=httpx2.Timeout(10.0))
-        redis = Redis(
+        # A blocking pool waits briefly for a free connection instead of failing at once:
+        # a burst of requests queues rather than turning every budget check into an error.
+        redis_password = settings.redis_password
+        pool = BlockingConnectionPool(
+            max_connections=settings.redis_pool_size,
+            timeout=5,
+            connection_class=SSLConnection if settings.redis_tls else Connection,
             host=settings.redis_host,
             port=settings.redis_port,
             db=settings.redis_db,
-            password=settings.redis_password.get_secret_value()
-            if settings.redis_password
-            else None,
-            ssl=settings.redis_tls,
+            password=redis_password.get_secret_value() if redis_password else None,
             decode_responses=True,
-            max_connections=settings.redis_pool_size,
             health_check_interval=30,
         )
+        redis = Redis.from_pool(pool)  # owns the pool: aclose() disconnects every connection
         db: asyncpg.Pool | None = None
         try:
             await redis.ping()
@@ -103,6 +111,7 @@ class GatewayRuntime:
                 await apply_migrations(db)
             keys = RedisKeys(settings.redis_key_prefix)
             bus = EventBus(redis, keys, maxlen=settings.event_stream_maxlen)
+            hub = EventHub(bus)
             webhooks = None
             if settings.webhook_url and settings.webhook_hmac_key:
                 webhooks = WebhookDispatcher(
@@ -126,14 +135,21 @@ class GatewayRuntime:
                 strict_arguments=settings.strict_tool_arguments,
             )
             budget = BudgetLedger(redis, keys)
+            spend = SpendEvents(
+                budget=budget,
+                notifier=notifier,
+                instruments=instruments,
+                warn_at_ratio=policy.document.budgets.warn_at_ratio,
+            )
             sessions = SessionDirectory(redis, keys)
             breaker = CircuitBreaker(redis, keys)
             approvals = ApprovalService(
                 store=ApprovalStore(db),
-                bus=bus,
+                hub=hub,
                 notifier=notifier,
                 registry=registry,
                 budget=budget,
+                spend=spend,
                 policy=policy,
                 engine=engine,
                 instruments=instruments,
@@ -147,6 +163,7 @@ class GatewayRuntime:
                 sessions=sessions,
                 approvals=approvals,
                 notifier=notifier,
+                spend=spend,
                 instruments=instruments,
             )
         except BaseException:
@@ -164,7 +181,9 @@ class GatewayRuntime:
             redis=redis,
             db=db,
             bus=bus,
+            hub=hub,
             notifier=notifier,
+            spend=spend,
             breaker=breaker,
             budget=budget,
             sessions=sessions,
@@ -193,6 +212,9 @@ class GatewayRuntime:
         for task in self._tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await self.approvals.aclose()  # let in-flight approved calls finish
+        await self.hub.aclose()
+        await self.registry.aclose()
         if self.webhooks is not None:
             await self.webhooks.aclose()
         await self.db.close()
@@ -201,12 +223,17 @@ class GatewayRuntime:
         self.telemetry.shutdown()
 
     async def _sweep_approvals(self) -> None:
-        """Expire overdue approvals (any replica may run it; the UPDATE is idempotent)."""
+        """Expire overdue approvals and recover stalled ones. Any replica may run this:
+        every state change is a compare-and-set, so concurrent sweepers are harmless."""
         while True:
             try:
                 await self.approvals.expire_due()
+                await self.approvals.recover_stalled(
+                    approved_after_seconds=self.settings.approval_stalled_after_seconds,
+                    executing_after_seconds=self.settings.approval_interrupted_after_seconds,
+                )
             except Exception:
-                logger.exception("approval expiry sweep failed")
+                logger.exception("approval sweep failed")
             await asyncio.sleep(self.settings.approval_sweep_interval_seconds)
 
 

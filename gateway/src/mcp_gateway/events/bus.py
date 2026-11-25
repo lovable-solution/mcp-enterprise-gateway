@@ -36,6 +36,12 @@ APPROVAL_EVENTS: Final[frozenset[str]] = frozenset(
 STREAM_START: Final = "0-0"
 
 
+def stream_position(entry_id: str) -> tuple[int, int]:
+    """Order of a Redis stream id ("<ms>-<seq>")."""
+    millis, _, sequence = entry_id.partition("-")
+    return int(millis), int(sequence or 0)
+
+
 class GatewayEvent(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -68,6 +74,21 @@ class EventBus:
         """Position to read from to receive only events published after this call."""
         entries = await self._redis.xrevrange(self._keys.events(tenant_id), count=1)
         return str(entries[0][0]) if entries else STREAM_START
+
+    async def range_after(
+        self, tenant_id: str, after_id: str, *, count: int = 1_000
+    ) -> list[GatewayEvent]:
+        """Events strictly after ``after_id`` that are already in the stream (no blocking)."""
+        entries = await self._redis.xrange(
+            self._keys.events(tenant_id), min=f"({after_id}", count=count
+        )
+        return [
+            GatewayEvent.model_validate_json(str(fields["event"])).model_copy(
+                update={"id": str(entry_id)}
+            )
+            for entry_id, fields in (entries or [])
+            if fields is not None
+        ]
 
     async def read(
         self, tenant_id: str, after_id: str, *, block_ms: int, count: int = 100

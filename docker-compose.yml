@@ -9,11 +9,14 @@
 #   otel-collector  the single OTLP ingress for every service
 #   jaeger          traces       http://localhost:16686
 #   prometheus      metrics      http://localhost:9090
-# agent-runtime and operator-ui join in Phase 3.
+#   operator-ui     operator console: approvals, sessions, alerts   http://localhost:3000
+#   agent-runtime   LangGraph agent CLI (profile "agent"):
+#                   docker compose run --rm agent-runtime run "..." --wait
 #
 # Network zones mirror the AWS security groups:
-#   edge      clients -> gateway            upstream  gateway <-> MCP servers (internal)
-#   data      gateway -> postgres, redis    telemetry services -> collector -> backends
+#   edge         clients -> gateway            upstream   gateway <-> MCP servers (internal)
+#   data         gateway -> postgres, redis    telemetry  services -> collector -> backends
+#   checkpoints  agent-runtime -> postgres (its own database only; no route to Redis)
 #
 # Secrets have no defaults: `make env` writes .env with random values, and
 # Compose refuses to start without them. Published ports bind to 127.0.0.1.
@@ -61,7 +64,7 @@ services:
       timeout: 3s
       retries: 30
       start_period: 30s
-    networks: [data]
+    networks: [data, checkpoints]
 
   redis:
     <<: *hardened
@@ -119,7 +122,8 @@ services:
       GATEWAY_JWT_ISSUER: ${GATEWAY_JWT_ISSUER:-http://localhost/dev-idp}
       GATEWAY_WEBHOOK_URL: ${GATEWAY_WEBHOOK_URL:-}
       GATEWAY_WEBHOOK_HMAC_KEY: ${WEBHOOK_HMAC_KEY:?WEBHOOK_HMAC_KEY is not set - run `make env`}
-      GATEWAY_CORS_ORIGINS: '["http://localhost:3000"]' # operator console (Phase 3)
+      # No CORS origins: the operator console is a backend-for-frontend, so browsers
+      # never call the gateway directly.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       OTEL_METRIC_EXPORT_INTERVAL: "15000"
     ports:
@@ -151,6 +155,64 @@ services:
       OTEL_METRIC_EXPORT_INTERVAL: "15000"
     # No published ports and no edge network: agents cannot reach it, only the gateway.
     networks: [upstream, telemetry]
+
+  operator-ui:
+    <<: *hardened
+    build:
+      context: ./operator-ui
+    image: mcp-enterprise-gateway/operator-ui:local
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: [/tmp, /app/.next/cache]
+    environment:
+      GATEWAY_URL: http://gateway:8000
+      SESSION_SECRET: ${CONSOLE_SESSION_SECRET:?CONSOLE_SESSION_SECRET is not set - run `make env`}
+      # Local development: sign in by minting operator tokens with the gateway's dev
+      # secret. Deployed consoles set DEV_SIGNIN=false and accept IdP tokens only.
+      DEV_SIGNIN: "true"
+      GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET is not set - run `make env`}
+      GATEWAY_JWT_ISSUER: ${GATEWAY_JWT_ISSUER:-http://localhost/dev-idp}
+      CONSOLE_TENANT: ${CONSOLE_TENANT:-acme}
+      COOKIE_SECURE: "false" # plain HTTP on localhost; deployed consoles sit behind TLS
+    ports:
+      - "127.0.0.1:${CONSOLE_HOST_PORT:-3000}:3000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks: [edge]
+
+  agent-runtime:
+    <<: *hardened
+    profiles: ["agent"] # a job, not a service: `docker compose run --rm agent-runtime ...`
+    restart: "no"
+    build:
+      context: .
+      dockerfile: agent-runtime/Dockerfile
+    image: mcp-enterprise-gateway/agent-runtime:local
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: [/tmp]
+    environment:
+      AGENT_ENVIRONMENT: local
+      # The gateway is the agent's only route to tools; crm-ops is not even routable.
+      AGENT_GATEWAY_URL: http://gateway:8000
+      # Local development: per-thread HS256 tokens signed with the gateway's dev secret.
+      # Deployed environments set AGENT_GATEWAY_TOKEN from the IdP instead.
+      AGENT_DEV_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET is not set - run `make env`}
+      AGENT_DEV_JWT_ISSUER: ${GATEWAY_JWT_ISSUER:-http://localhost/dev-idp}
+      AGENT_ROLE: ${AGENT_ROLE:-admin}
+      AGENT_DATABASE_HOST: postgres
+      AGENT_DATABASE_PORT: "5432"
+      AGENT_DATABASE_NAME: ${AGENT_DB_NAME:-agent_runtime}
+      AGENT_DATABASE_USER: ${AGENT_DB_USER:-agent_runtime}
+      AGENT_DATABASE_PASSWORD: ${AGENT_DB_PASSWORD:?AGENT_DB_PASSWORD is not set - run `make env`}
+      AGENT_DATABASE_SSL: disable # container network only
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-} # checked when a run starts
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks: [edge, checkpoints, telemetry]
 
   otel-collector:
     <<: *hardened
@@ -220,7 +282,8 @@ networks:
   edge: {} # clients (agents, operator console) -> gateway
   upstream:
     internal: true # gateway <-> MCP servers; no route to the host or the internet
-  data: {} # gateway -> postgres, redis (+ agent-runtime checkpoints in Phase 3)
+  data: {} # gateway -> postgres, redis
+  checkpoints: {} # agent-runtime -> postgres (LangGraph checkpoints)
   telemetry: {} # every service -> otel-collector -> jaeger / prometheus
 
 volumes:

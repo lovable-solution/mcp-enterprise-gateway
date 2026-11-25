@@ -58,6 +58,8 @@ class Outcome(StrEnum):
     EXPIRED = "expired"
     APPROVAL_FAILED = "approval_failed"
     UPSTREAM_UNAVAILABLE = "upstream_unavailable"
+    ERROR = "error"
+    """The gateway itself failed (e.g. Redis unreachable); the call was refused."""
 
 
 @dataclass(frozen=True, slots=True)

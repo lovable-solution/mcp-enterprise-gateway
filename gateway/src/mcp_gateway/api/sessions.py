@@ -116,7 +116,10 @@ async def report_usage(
         cost_usd=priced.cost_usd,
         ttl_seconds=policy.budgets.ledger_ttl_seconds,
     )
-    labels = {Attr.MODEL: report.model, Attr.TENANT: principal.tenant_id}
+    # Only priced models become metric labels: the model id is caller-supplied, and an
+    # unbounded label would let any agent create arbitrarily many metric series.
+    model_label = report.model if report.model in policy.pricing.models else "(unpriced)"
+    labels = {Attr.MODEL: model_label, Attr.TENANT: principal.tenant_id}
     for token_type, count in (
         ("input", report.input_tokens),
         ("output", report.output_tokens),
@@ -126,7 +129,14 @@ async def report_usage(
         if count:
             runtime.instruments.tokens.add(count, {**labels, Attr.TOKEN_TYPE: token_type})
     runtime.instruments.cost_usd.add(float(priced.cost_usd), {**labels, Attr.COST_SOURCE: "llm"})
-    await runtime.pipeline.after_spend(principal, snapshot, model=report.model)
+    await runtime.spend.after_spend(
+        tenant_id=principal.tenant_id,
+        session_id=session_id,
+        subject=principal.subject,
+        role=principal.role,
+        snapshot=snapshot,
+        model=report.model,
+    )
     return UsageAccepted(
         cost_usd=priced.cost_usd, priced_at_fallback=priced.priced_at_fallback, budget=snapshot
     )

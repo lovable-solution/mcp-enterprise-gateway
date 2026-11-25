@@ -8,9 +8,145 @@ Protocol (MCP) servers. Agents connect to the gateway and nowhere else. The gate
 - suspends high-consequence calls for human approval (PostgreSQL);
 - traces all of it (OpenTelemetry).
 
-> **Status: Phase 2 of 4.** The gateway runtime and the crm-ops MCP server are done,
-> together with the guardrail test suite. Still to come: the agent runtime and operator
-> console (Phase 3), then the Terraform implementation (Phase 4). See the [build plan](#build-plan).
+An agent runtime (LangGraph + PydanticAI, Claude) works through the gateway, pausing
+durably while humans decide. An operator console shows the approval queue, live spend
+and alerts. Terraform deploys the whole system to AWS as private Fargate services behind
+an internal load balancer, with no hardcoded secrets.
+
+> **Status: complete (Phases 1-4).** Every component is built and tested: unit,
+> integration against real PostgreSQL and Redis, live Claude runs, and plan-time tests of
+> every Terraform module. See the [build plan](#build-plan).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph agents["Agents"]
+    runtime["Agent runtime<br/>LangGraph + PydanticAI"]
+    client["Any MCP client"]
+  end
+  operator(("Operator"))
+  claude["Claude API"]
+
+  subgraph platform["Governed by the gateway"]
+    gateway["MCP gateway<br/>auth · policy · loop breaker<br/>budgets · approvals"]
+    console["Operator console<br/>Next.js backend-for-frontend"]
+  end
+
+  subgraph servers["MCP servers: reachable from the gateway only"]
+    crm["crm-ops<br/>search · metrics · credit limits"]
+  end
+
+  pg[("PostgreSQL<br/>approvals · agent checkpoints")]
+  redis[("Redis<br/>budgets · breakers · event streams")]
+  idp["Identity provider<br/>JWKS"]
+  otel["OpenTelemetry Collector<br/>traces · metrics"]
+
+  runtime -->|"MCP + JWT"| gateway
+  client -->|"MCP + JWT"| gateway
+  runtime -->|"model calls"| claude
+  runtime -->|"checkpoints"| pg
+  operator -->|"browser"| console
+  console -->|"control-plane API, server-side"| gateway
+  gateway -->|"signed identity assertion"| crm
+  gateway --> pg
+  gateway --> redis
+  gateway -.->|"signing keys"| idp
+  gateway -.-> otel
+  crm -.-> otel
+  runtime -.-> otel
+```
+
+| Component | Role |
+| --- | --- |
+| `gateway/` | FastAPI + the official MCP SDK. The single entry point for agents (`/mcp`) and the control plane (`/v1/*`): approvals, sessions, events (SSE), usage reports. |
+| `mcp-servers/crm-ops/` | A sample MCP server with three CRM tools. It trusts only short-lived identity assertions signed by the gateway, and scopes every lookup to the asserted tenant. |
+| `agent-runtime/` | A LangGraph graph around a PydanticAI agent (Claude Opus 5.5). It turns the gateway's verdicts into control flow, and checkpoints in PostgreSQL while a human decides. |
+| `operator-ui/` | Next.js 15 console with an approval queue, a JSON payload viewer, live token and dollar burn, and breaker alerts. Operator tokens never reach the browser. |
+| `infra/terraform/` | VPC, ECS Fargate, RDS PostgreSQL, ElastiCache, Secrets Manager. |
+
+## How a tool call is governed
+
+Every `tools/call` passes the same checks in this order, and each refusal comes back as a
+structured verdict (`_meta["mcp-enterprise-gateway/governance"]`) that agents act on:
+
+```mermaid
+flowchart TD
+  req(["tools/call from an agent"]) --> authn{"Valid JWT?<br/>issuer, audience,<br/>algorithm allow-list"}
+  authn -->|"no"| unauthorised["401: the request never reaches the pipeline"]
+  authn -->|"yes"| loop{"4th identical call in 60 s,<br/>or breaker already open?"}
+  loop -->|"yes"| open["CIRCUIT_OPEN<br/>session paused until it cools down or is reset"]
+  loop -->|"no"| rbac{"Does the policy let<br/>this role call this tool?"}
+  rbac -->|"no: default deny"| denied["Unknown tool<br/>tool_call.denied event"]
+  rbac -->|"yes"| args{"Upstream available,<br/>arguments match its schema?"}
+  args -->|"no"| invalid["UPSTREAM_UNAVAILABLE or<br/>INVALID_ARGUMENTS"]
+  args -->|"yes"| budget{"Budget left?<br/>calls · tokens · USD"}
+  budget -->|"no"| exhausted["BUDGET_EXCEEDED"]
+  budget -->|"yes"| gate{"Needs human<br/>approval?"}
+  gate -->|"yes"| held["Stored as PENDING_APPROVAL<br/>console and webhook notified<br/>held up to the inline wait"]
+  held -->|"decided in time"| decided["APPROVED: the real result<br/>REJECTED: the reviewer's reason"]
+  held -->|"still undecided"| pending["PENDING_APPROVAL<br/>the agent checkpoints"]
+  gate -->|"no"| forward["Charge the budget atomically, then call the<br/>MCP server with a signed identity assertion"]
+  forward --> result["Result + session.activity event"]
+  forward -.->|"server never reached"| refunded["UPSTREAM_UNAVAILABLE<br/>charge refunded"]
+  forward -.->|"no answer"| unknown["OUTCOME_UNKNOWN<br/>check before repeating"]
+```
+
+Loop detection runs before authorisation on purpose: hammering a forbidden tool trips the
+breaker too.
+
+## Human in the loop, end to end
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant A as Agent runtime
+  participant G as Gateway
+  participant P as PostgreSQL
+  participant R as Redis streams
+  participant C as Operator console
+  participant M as crm-ops
+  A->>G: tools/call update_credit_limit
+  G->>P: insert PENDING_APPROVAL (payload frozen)
+  G->>R: approval.requested
+  R-->>C: live event (SSE)
+  Note over G: holds the call for the inline wait, sending progress
+  G-->>A: PENDING_APPROVAL with the approval id
+  Note over A: interrupt(), thread checkpointed, the process may exit
+  C->>G: decide: approve (operator, not the requester)
+  G->>P: APPROVED, then EXECUTING (claimed exactly once)
+  G->>M: the stored payload, with a signed identity assertion
+  M-->>G: result
+  G->>P: EXECUTED with the result
+  G->>R: approval.executed, session.activity
+  A->>G: resume: GET /v1/approvals/:id
+  G-->>A: EXECUTED, the recorded result, the reviewer
+  Note over A: the model reports the outcome
+```
+
+The database itself enforces the approval state machine with a trigger, keeps the
+payload immutable, and makes the audit trail append-only:
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING_APPROVAL: call held
+  PENDING_APPROVAL --> APPROVED: an approver decides
+  PENDING_APPROVAL --> REJECTED: rejected with a reason
+  PENDING_APPROVAL --> EXPIRED: no decision before the timeout
+  APPROVED --> EXECUTING: claimed by one replica
+  APPROVED --> FAILED: could not start
+  EXECUTING --> EXECUTED: the MCP server answered
+  EXECUTING --> FAILED: unreachable, or interrupted mid-call
+  REJECTED --> [*]
+  EXPIRED --> [*]
+  EXECUTED --> [*]
+  FAILED --> [*]
+```
+
+A background sweeper keeps this honest across crashes:
+- An approved call that no replica started is executed.
+- A call interrupted mid-flight is marked `FAILED` with an unknown outcome, and is never
+  re-run blindly.
 
 ## Repository layout
 
@@ -20,27 +156,31 @@ mcp-enterprise-gateway/
 ├── gateway/                     FastAPI + MCP SDK: auth, RBAC, budgets, breaker, HITL, API
 ├── mcp-servers/crm-ops/         sample MCP server (MCPServer): 3 CRM tools, tenant-scoped
 ├── libs/platform-telemetry/     shared OpenTelemetry bootstrap
-├── agent-runtime/               LangGraph + PydanticAI orchestrator              (Phase 3)
-├── operator-ui/                 Next.js 15 operator console                      (Phase 3)
+├── agent-runtime/               LangGraph + PydanticAI agent; CLI; Postgres checkpoints
+├── operator-ui/                 Next.js 15 operator console (backend-for-frontend)
 ├── infra/local/                 compose support: OTel Collector, Prometheus, Postgres init
-├── infra/terraform/             AWS modules + dev environment (interfaces; Phase 4 resources)
-├── docker-compose.yml           gateway, crm-ops, Postgres, Redis, OTel Collector, Jaeger, Prometheus
+├── infra/terraform/             AWS: 5 modules, the dev environment, plan-time tests
+├── docker-compose.yml           the whole stack, plus the agent runtime as a job (profile "agent")
 └── Makefile                     `make` lists every target
 ```
 
 ## Quick start
 
-Requires Docker with Compose v2, [uv](https://docs.astral.sh/uv/) >= 0.9 and GNU Make.
+Requires Docker with Compose v2, [uv](https://docs.astral.sh/uv/) >= 0.9, GNU Make, and
+for the console's checks Node.js >= 20.18 with pnpm 9 (`corepack enable`).
 
 ```bash
-make env       # .env with generated secrets (git-ignored, mode 600)
-make up        # build and start the whole stack; waits until it is healthy
-make sync      # Python workspace (CPython 3.12)
-make verify    # compose config, policy, lint, mypy --strict, all tests, terraform fmt + validate
+make env         # .env with generated secrets (git-ignored, mode 600)
+                 # then set ANTHROPIC_API_KEY in .env to run the agent
+make up          # build and start the whole stack; waits until it is healthy
+make sync        # Python workspace (CPython 3.12)
+make ui-install  # console dependencies (pnpm, frozen lockfile)
+make verify      # compose config, policy, lint, mypy --strict, all tests, console, terraform
 ```
 
 | Service | Address (127.0.0.1 only) |
 | --- | --- |
+| Operator console | http://localhost:3000 |
 | Gateway: MCP endpoint / API docs | http://localhost:8000/mcp, http://localhost:8000/docs |
 | Jaeger / Prometheus | http://localhost:16686, http://localhost:9090 |
 | PostgreSQL / Redis | localhost:15432, localhost:16379 |
@@ -49,27 +189,30 @@ crm-ops publishes no port: it is reachable from the gateway only.
 
 ## Try it
 
-```bash
-AGENT=$(make -s token ROLE=admin)                       # an agent session token
-OPS=$(uv run mcp-gateway-token --role operator --no-session)
-```
-
-Point any MCP client at `http://localhost:8000/mcp` with `Authorization: Bearer $AGENT`.
-
-1. The `analyst` role sees only the two read tools; `admin` also sees
-   `crm-ops__update_credit_limit`.
-2. Call `crm-ops__update_credit_limit`. The call is held, and
-   `curl -H "Authorization: Bearer $OPS" localhost:8000/v1/approvals` shows it pending.
-3. Approve it:
+1. **Give the agent a task that needs a human decision.**
 
    ```bash
-   curl -X POST -H "Authorization: Bearer $OPS" -H 'Content-Type: application/json' \
-     -d '{"decision":"approve"}' localhost:8000/v1/approvals/<id>/decide
+   make agent-run PROMPT='Check the receivables of Alder Freight and request raising its credit limit to $600,000 for the Q4 peak.'
    ```
 
-   The held call returns the real result.
-4. Repeat any identical call four times within 60 s. The session's breaker trips and
-   every further call is refused until an operator resets it.
+   The agent (Claude Opus 5.5) searches the CRM and reads the account's metrics, then
+   asks for the change. The gateway holds that call. The thread is checkpointed in
+   PostgreSQL and the command exits with code 2 and the thread id. Nothing has changed
+   in the CRM.
+2. **Decide.** Open http://localhost:3000 and use *Development sign-in* as an
+   `operator`. The held call shows its exact arguments. *Approve and run* executes the
+   stored payload; *Reject* needs a reason. The console also shows each session's live
+   token and dollar burn, and any alerts.
+3. **Resume.** `make agent-resume THREAD=t-...` starts a fresh container, loads the
+   thread from its checkpoint and asks the gateway for the outcome. The agent then
+   reports what happened, including a rejection and its reason. A resume before the
+   decision changes nothing.
+
+Without the agent, any MCP client can talk to `http://localhost:8000/mcp` with a token
+from `make -s token ROLE=admin`:
+- `analyst` sees only the two read tools;
+- the fourth identical call within 60 s trips the session's circuit breaker, and the
+  console offers *Reset*.
 
 ## The policy
 
@@ -94,19 +237,165 @@ broken:
 - **Timing and pricing:** approval timings must be consistent, and fallback pricing
   conservative.
 
+## The agent runtime
+
+`agent-runtime/` is a LangGraph graph around a PydanticAI agent. Its only route to tools
+is the gateway's MCP endpoint, under a per-thread token whose `sid` is the thread id, so
+the gateway budgets, rate-limits and audits each thread as one session.
+
+```mermaid
+flowchart LR
+  entry(["START"]) --> agent["agent<br/>PydanticAI run over the thread's history"]
+  agent -->|"answer, halted or failed"| finish(["END"])
+  agent -->|"a call is held for approval"| wait["await_approval<br/>interrupt(): checkpointed, the process may exit"]
+  wait -->|"resumed, but still pending"| wait
+  wait -->|"every held call decided,<br/>as reported by the gateway"| agent
+```
+
+The toolset turns each gateway verdict into agent control flow:
+
+| Gateway result | Agent behaviour |
+| --- | --- |
+| tool result, or `APPROVED` inline | returned to the model |
+| `PENDING_APPROVAL` | `CallDeferred`: the run ends with `DeferredToolRequests`; the graph checkpoints and interrupts |
+| `INVALID_ARGUMENTS` | `ModelRetry`: the model fixes its arguments |
+| `BUDGET_EXCEEDED`, `CIRCUIT_OPEN` | the thread halts; `agent-runtime retry` continues it after an operator acts |
+| `REJECTED`, `EXPIRED`, `APPROVAL_FAILED`, `UPSTREAM_UNAVAILABLE`, `OUTCOME_UNKNOWN`, policy denial | `ToolFailed`: the model must report it and must not repeat the call |
+
+- **Decisions come from the gateway.** On resume, the graph asks the gateway for each
+  approval. Whatever value a client passes to `Command(resume=...)` is ignored. An
+  executed call returns the upstream result the gateway recorded, with the reviewer's
+  name.
+- **Spend is reported per response, and the runtime fails closed.** Each model response's
+  tokens go to `POST /v1/sessions/{sid}/usage`. That includes 5-minute and 1-hour cache
+  writes, and it names the model that actually answered. If the gateway does not accept
+  the report, the run stops.
+- **Model:** `claude-opus-5-5` with adaptive thinking at `medium` effort, streaming,
+  automatic prompt caching, and **server-side fallbacks** (`fallbacks: "default"`, beta
+  `server-side-fallback-2026-07-01`). A request that a safety classifier declines is
+  re-run on Anthropic's recommended fallback model instead of failing. Turn this off
+  with `AGENT_SERVER_SIDE_FALLBACKS=false`.
+- **Stopped runs keep their work.** A run that halts or fails keeps its history up to the
+  last consistent point, so a retry does not redo or re-pay for completed steps.
+
+CLI: `agent-runtime run|resume|status|retry`, with `--wait` to follow decisions. Exit
+codes: 0 completed, 2 awaiting approval, 3 halted, 1 failed. Settings are `AGENT_*`
+variables; see `agent-runtime/README.md`. A typical governed task (three tool calls and
+four model requests) costs about $0.03 in model usage.
+
+## The operator console
+
+`operator-ui/` is a backend-for-frontend. The browser talks only to the console. Its route
+handlers call the gateway with the operator's token, which is kept in an encrypted
+(A256GCM), httpOnly, SameSite=Strict cookie and never reaches page scripts.
+- **Requests:** state-changing calls also pass a same-origin check. Route parameters are
+  validated before they become gateway URLs.
+- **Live updates:** the gateway's event stream is relayed as SSE, resuming with
+  `Last-Event-ID`.
+- **Permissions:** what a role may do (decide, reset breakers) comes from the gateway's
+  policy at sign-in, and the gateway re-checks every request.
+- **Sign-in:** locally, *Development sign-in* mints a short-lived token with the gateway's
+  development secret. Deployed consoles set `DEV_SIGNIN=false` and accept identity
+  provider tokens.
+
+## Deploying to AWS
+
+`infra/terraform/environments/dev` deploys the system with five modules:
+- `vpc`
+- `secrets_manager`
+- `rds_postgres`
+- `elasticache_redis`
+- `ecs_fargate`
+
+Nothing listens on a public address.
+
+```mermaid
+flowchart TB
+  clients["Agents and operators<br/>alb_ingress_cidrs only"]
+  idp["Identity provider<br/>JWKS"]
+  anthropic["Claude API"]
+
+  subgraph vpc["VPC: 2-3 availability zones"]
+    subgraph public["public subnets"]
+      nat["NAT gateway"]
+    end
+    subgraph app["private-app subnets: no public IPs"]
+      alb["Internal ALB<br/>HTTPS only, TLS 1.3 / 1.2"]
+      gateway["gateway<br/>autoscaled"]
+      console["operator-ui"]
+      crm["crm-ops<br/>admits the gateway only"]
+      tasks["on-demand tasks<br/>db-bootstrap · agent-runtime"]
+      endpoints["VPC endpoints<br/>ECR · Secrets Manager · Logs · STS · KMS"]
+    end
+    subgraph data["private-data subnets: no route out"]
+      rds[("RDS PostgreSQL<br/>TLS only, RDS-managed master secret")]
+      cache[("ElastiCache<br/>TLS + AUTH, noeviction")]
+    end
+  end
+  secrets["Secrets Manager<br/>KMS key with rotation"]
+
+  clients -->|"443"| alb
+  alb -->|"/mcp · /v1/* · health"| gateway
+  alb -->|"everything else"| console
+  console -->|"Service Connect"| gateway
+  gateway -->|"Service Connect"| crm
+  gateway -->|"5432"| rds
+  gateway -->|"6379 TLS"| cache
+  tasks -->|"5432"| rds
+  tasks -->|"agent: through the ALB, like any agent"| alb
+  gateway -->|"443"| nat
+  tasks -->|"443"| nat
+  nat --> idp
+  nat --> anthropic
+  endpoints -.->|"secrets injected at task start"| secrets
+```
+
+- **One way in.** The internal ALB exposes only the gateway and the console, and only on
+  HTTPS.
+- **MCP servers are east-west only.** They are reached over ECS Service Connect, and each
+  admits only the gateway's security group. Every workload has its own security group,
+  with least-privilege egress.
+- **Zero hardcoded secrets.** Generated secrets are written with write-only arguments, so
+  they appear in neither plans nor state. ElastiCache reads its AUTH token back
+  ephemerally. RDS manages and rotates its own master credential, and only the one-off
+  `db-bootstrap` task can read it.
+- **Hardened containers.** They use read-only root filesystems, images pinned by digest,
+  and no shell access (ECS Exec off). Each execution role can read only that workload's
+  own secrets.
+
+`infra/terraform/README.md` has the deployment runbook. `make tf-test` checks all of this
+without an AWS account: plan-time tests run every module against mocked providers.
+
 ## Guardrail tests
 
-`make test` runs 174 tests in about 20 s. The 36 integration tests run against real
-Postgres and Redis (`make up`), real gateway and crm-ops servers, and the official MCP
-client:
+| Command | What runs |
+| --- | --- |
+| `make test` | 242 Python tests in about 50 s, including 53 integration tests against real PostgreSQL and Redis (`make up`), real gateway and crm-ops servers, and the official MCP client |
+| `make ui-check` | the console's ESLint, TypeScript and 29 unit tests |
+| `make tf-test` | 33 Terraform tests across the five modules and the dev environment, with mocked AWS (no account, no cost) |
+| `make test-live` | the pause, approve and resume flow with real Claude; prints its cost (opt-in) |
 
 | Suite | Proves |
 | --- | --- |
 | `test_rbac.py` | (a) unauthorised tools are denied before anything reaches upstream; tools/list filtered per role; tenant isolation; bad tokens (expired, forged, `alg=none`, wrong audience) rejected |
 | `test_circuit_breaker.py` | (b) the 4th identical call in 60 s trips the session breaker; per-session; denied-tool hammering trips too; operator-only reset; signed webhook |
-| `test_hitl.py` | (c) pause -> approve -> resume inline; checkpoint + resume after the inline wait; reject; de-duplication (executed once); four-eyes and tenant guards; expiry; database-enforced invariants |
-| `test_budgets.py` | tool-call and USD caps; exact per-token-type pricing; conservative fallback; metered tools |
+| `test_hitl.py` | (c) pause -> approve -> resume inline; checkpoint + resume after the inline wait; reject; de-duplication (executed once); four-eyes and tenant guards; decide-only approvers; expiry; crash recovery (an approved call a dead replica never started runs; an interrupted one fails, never re-runs); database-enforced invariants |
+| `test_budgets.py` | tool-call and USD caps; exact pricing per token type and cache TTL; conservative fallback; metered tools; unpriced model ids never become metric labels |
+| `test_failure_handling.py` | event hub: fan-out, paged resume without gaps, slow-subscriber drop; refunds floor at zero; an unreachable upstream is reported and refunded |
 | `test_events_and_tracing.py` | SSE with `Last-Event-ID` resume; one trace spanning agent -> gateway -> crm-ops |
+| `agent-runtime/.../test_hitl_flow.py` | (c) for the agent: a held call pauses the thread; a **second process** resumes it from PostgreSQL after approval; rejections reach the model; forged resume payloads are ignored; inline approvals need no pause; an exhausted budget halts the thread |
+| `infra/terraform/**/tests` | only the gateway and console face clients; crm-ops admits the gateway alone; tasks accept no traffic; each workload reads only its own secrets; no secret value in state; the data tier has no route out; TLS-only database and cache; `noeviction` |
+
+## Supply chain
+
+- `make audit` runs pip-audit over the exact locked dependency set. Two advisories with
+  no fixed release are accepted, and the Makefile says why: python-jose's DER-key HMAC
+  confusion (PYSEC-2026-4298) and ecdsa's signing timing leak (PYSEC-2026-1325). Neither
+  is reachable here, and regression tests pin both mitigations: the algorithm allow-list
+  is checked before any key is chosen, and jose runs on its `cryptography` backends.
+- The Terraform scans clean with Trivy at every severity. It has two justified, in-code
+  exceptions: plain HTTP in the explicit sandbox mode, and HTTPS egress to the internet
+  for the identity provider and model APIs.
 
 ## Design decisions
 
@@ -120,7 +409,11 @@ client:
 | Upstreams receive signed, short-lived identity assertions, never agent tokens | MCP servers trust the gateway's authorisation and can scope data to the asserted tenant. |
 | Redis Lua scripts for every check-and-update; server time; `noeviction` | Atomic across replicas; an evicted key cannot silently reset a budget. |
 | Events on Redis Streams | SSE clients resume with `Last-Event-ID`, and waiters cannot miss a decision. |
-| Separate Postgres database and role per service | The agent runtime can never write to the approvals table. |
+| Separate Postgres database and role per service | The agent runtime can never write to the approvals table, and in compose it cannot even reach Redis. |
+| Approved calls survive a crashed replica | A sweeper runs approved calls that no replica started. A call interrupted mid-flight is marked failed with an unknown outcome and is never re-run blindly. |
+| Refund only what provably never ran | A call refused before it reached the upstream is refunded. After a timeout the outcome is unknown, so the agent is told to check before repeating it. |
+| The console is a backend-for-frontend | Operator tokens stay server-side, the gateway needs no CORS, and an XSS bug could not steal a token. |
+| Service roles are created by a one-off task, not Terraform | No database provider (and no database credential) in the Terraform pipeline; the task is idempotent and doubles as password rotation. |
 | No default credentials anywhere | Compose refuses to start without generated secrets; in AWS the IdP's JWKS, RDS-managed credentials and write-only secrets replace them. |
 
 ## Build plan
@@ -129,5 +422,5 @@ client:
 | --- | --- | --- |
 | 1 | Repo structure, compose stack, policy schema + engine, Terraform interfaces | done |
 | 2 | crm-ops MCP server; gateway: JWT RBAC, Redis budget/loop middleware, HITL state machine; guardrail tests | done |
-| 3 | agent-runtime (LangGraph + PydanticAI), operator-ui (Next.js) | next |
-| 4 | Terraform module implementations, comprehensive README with Mermaid diagrams | |
+| 3 | agent-runtime (LangGraph + PydanticAI), operator-ui (Next.js); Phase 1-2 review fixes | done |
+| 4 | Terraform module implementations with plan-time tests; README with Mermaid diagrams | done |

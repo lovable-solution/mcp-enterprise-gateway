@@ -39,6 +39,11 @@ variable "engine_version" {
   description = "Engine version. The local compose stack pins a Redis release no newer than this feature set."
   type        = string
   default     = "7.1"
+
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+$", var.engine_version)) && (var.engine != "valkey" || tonumber(split(".", var.engine_version)[0]) >= 8 || var.engine_version == "7.2")
+    error_message = "engine_version must be <major>.<minor>; Valkey starts at 7.2."
+  }
 }
 
 variable "node_type" {
@@ -63,6 +68,12 @@ variable "auth_token_secret_arn" {
   type        = string
 }
 
+variable "auth_token_version" {
+  description = "Write-only version of the AUTH token. Pass the secret's version (secrets_manager output `secret_versions`): bumping it there writes a new secret value and rotates the cache's token in the same apply."
+  type        = number
+  default     = 1
+}
+
 variable "kms_key_arn" {
   description = "Customer-managed KMS key for at-rest encryption (null: AWS-managed key)."
   type        = string
@@ -73,6 +84,12 @@ variable "snapshot_retention_days" {
   description = "Daily snapshot retention. Budget ledgers are short-lived, so 1 day suffices for most environments."
   type        = number
   default     = 1
+}
+
+variable "logs_kms_key_arn" {
+  description = "KMS key for this module's CloudWatch log group (null: AWS-managed encryption). Its key policy must allow the CloudWatch Logs service principal (the secrets_manager module's key does)."
+  type        = string
+  default     = null
 }
 
 variable "tags" {

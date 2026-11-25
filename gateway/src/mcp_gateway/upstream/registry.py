@@ -11,20 +11,21 @@ the declared contract.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final, Literal
 
-import anyio
 import httpx2
 import jsonschema
 from jsonschema.protocols import Validator
 from mcp import Client, MCPError
 from mcp.client.streamable_http import streamable_http_client
-from mcp_types import CallToolResult, Tool, ToolAnnotations
+from mcp_types import INTERNAL_ERROR, CallToolResult, Tool, ToolAnnotations
 
 from ..policy.models import AccessLevel, PolicyDocument, ToolPolicy
 from ..telemetry import Attr, Instruments
@@ -32,14 +33,47 @@ from .identity import GATEWAY_IDENTITY, AssertionSigner, CallerIdentity
 
 logger = logging.getLogger(__name__)
 
+_DISCOVERY_TIMEOUT_SECONDS: Final = 10.0
+_RETRY_SECONDS: Final = 5.0
+
 APPROVAL_NOTE = (
     "Calls are held for human approval before they run; a pending call returns an approval "
     "id instead of a result."
 )
 
 
+Executed = Literal["no", "unknown"]
+
+
 class UpstreamError(Exception):
-    """An upstream server could not be reached or refused the request."""
+    """An upstream server could not be reached or refused the request.
+
+    ``executed`` is ``"no"`` only when the upstream provably did not run the call (the
+    connection was never established, or it answered with a protocol error), so a budget
+    charge may be refunded. Anything else, such as a timeout after the request was sent,
+    is ``"unknown"``: the call may have taken effect.
+    """
+
+    def __init__(self, message: str, *, executed: Executed) -> None:
+        super().__init__(message)
+        self.executed: Executed = executed
+
+
+def _never_reached(exc: BaseException) -> bool:
+    """True when the exception chain shows the request never reached the upstream."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, httpx2.ConnectError | httpx2.ConnectTimeout):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        pending.extend(e for e in (current.__cause__, current.__context__) if e is not None)
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +98,7 @@ class _ServerState:
     fetched_at: float = float("-inf")
     error: str | None = None
     ever_fetched: bool = False
+    refresh: asyncio.Task[None] | None = None
 
 
 class UpstreamRegistry:
@@ -85,13 +120,21 @@ class UpstreamRegistry:
         self._timeout = timeout_seconds
         self._ttl = catalog_ttl_seconds
         self._strict = strict_arguments
+        self._discovery_timeout = min(timeout_seconds, _DISCOVERY_TIMEOUT_SECONDS)
         self._servers = {name: _ServerState() for name in self._upstreams}
-        self._lock = anyio.Lock()
 
     # --- catalog -------------------------------------------------------------------
     async def catalog(self) -> dict[str, CatalogEntry]:
-        """Registered tools available right now, refreshing stale servers first."""
-        await self.refresh()
+        """Registered tools available right now. Stale servers are refreshed in the
+        background (stale-while-revalidate): a slow or unreachable upstream never delays
+        requests, including those for other upstreams."""
+        now = time.monotonic()
+        for server, state in self._servers.items():
+            stale = now - state.fetched_at > self._ttl
+            if stale and (state.refresh is None or state.refresh.done()):
+                state.refresh = asyncio.create_task(
+                    self._refresh_server(server), name=f"discover:{server}"
+                )
         return self.cached_catalog()
 
     def cached_catalog(self) -> dict[str, CatalogEntry]:
@@ -112,30 +155,44 @@ class UpstreamRegistry:
         }
 
     async def refresh(self, *, force: bool = False) -> None:
+        """Refresh stale (or, with ``force``, all) servers now and wait for the result:
+        used at start-up so the first requests see a populated catalog."""
         now = time.monotonic()
-        stale = [s for s, st in self._servers.items() if force or now - st.fetched_at > self._ttl]
-        if not stale:
+        await asyncio.gather(
+            *(
+                self._refresh_server(server)
+                for server, state in self._servers.items()
+                if force or now - state.fetched_at > self._ttl
+            )
+        )
+
+    async def aclose(self) -> None:
+        tasks = [s.refresh for s in self._servers.values() if s.refresh and not s.refresh.done()]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _refresh_server(self, server: str) -> None:
+        state = self._servers[server]
+        try:
+            tools = await self._list_tools(server)
+        except UpstreamError as exc:
+            state.error = str(exc)
+            # Retry after a short pause rather than a full TTL.
+            state.fetched_at = time.monotonic() - self._ttl + min(self._ttl, _RETRY_SECONDS)
+            logger.warning("tool discovery failed for %s: %s", server, exc)
             return
-        async with self._lock:
-            now = time.monotonic()
-            for server in stale:
-                state = self._servers[server]
-                if not force and now - state.fetched_at <= self._ttl:
-                    continue  # refreshed while we waited for the lock
-                try:
-                    tools = await self._list_tools(server)
-                except UpstreamError as exc:
-                    state.error = str(exc)
-                    state.fetched_at = now - self._ttl + min(self._ttl, 5.0)  # retry soon
-                    logger.warning("tool discovery failed for %s: %s", server, exc)
-                    continue
-                state.entries = self._build_entries(server, tools)
-                state.fetched_at, state.error, state.ever_fetched = now, None, True
+        state.entries = self._build_entries(server, tools)
+        state.fetched_at, state.error, state.ever_fetched = time.monotonic(), None, True
 
     async def _list_tools(self, server: str) -> list[Tool]:
         tools: list[Tool] = []
         try:
-            async with self._client(server, GATEWAY_IDENTITY) as client:
+            async with self._client(
+                server, GATEWAY_IDENTITY, timeout=self._discovery_timeout
+            ) as client:
                 cursor: str | None = None
                 while True:
                     page = await client.list_tools(cursor=cursor)
@@ -144,7 +201,9 @@ class UpstreamRegistry:
                     if not cursor:
                         return tools
         except Exception as exc:
-            raise UpstreamError(f"{server} unreachable ({type(exc).__name__})") from exc
+            raise UpstreamError(
+                f"{server} unreachable ({type(exc).__name__})", executed="no"
+            ) from exc
 
     def _build_entries(self, server: str, tools: list[Tool]) -> dict[str, CatalogEntry]:
         entries: dict[str, CatalogEntry] = {}
@@ -188,10 +247,18 @@ class UpstreamRegistry:
                 result = await client.call_tool(entry.upstream_tool, dict(arguments))
         except MCPError as exc:
             attributes["error"] = True
-            raise UpstreamError(f"{entry.server} rejected the call: {exc.error.message}") from exc
+            # A protocol error means the tool did not run, unless the server itself failed.
+            executed: Executed = "unknown" if exc.error.code == INTERNAL_ERROR else "no"
+            raise UpstreamError(
+                f"{entry.server} rejected the call: {exc.error.message}", executed=executed
+            ) from exc
         except Exception as exc:
             attributes["error"] = True
-            raise UpstreamError(f"{entry.server} unreachable ({type(exc).__name__})") from exc
+            if _never_reached(exc):
+                raise UpstreamError(f"{entry.server} unreachable", executed="no") from exc
+            raise UpstreamError(
+                f"{entry.server} did not answer ({type(exc).__name__})", executed="unknown"
+            ) from exc
         else:
             attributes["error"] = result.is_error
             return result
@@ -199,15 +266,18 @@ class UpstreamRegistry:
             self._instruments.upstream_duration.record(time.perf_counter() - started, attributes)
 
     @asynccontextmanager
-    async def _client(self, server: str, identity: CallerIdentity) -> AsyncIterator[Client]:
+    async def _client(
+        self, server: str, identity: CallerIdentity, *, timeout: float | None = None
+    ) -> AsyncIterator[Client]:
+        timeout = timeout or self._timeout
         token = self._signer.sign(server, identity)
         http = httpx2.AsyncClient(
-            headers={"Authorization": f"Bearer {token}"}, timeout=httpx2.Timeout(self._timeout)
+            headers={"Authorization": f"Bearer {token}"}, timeout=httpx2.Timeout(timeout)
         )
         transport = streamable_http_client(self._upstreams[server], http_client=http)
         async with (
             http,
-            Client(transport, read_timeout_seconds=self._timeout, cache=None) as client,
+            Client(transport, read_timeout_seconds=timeout, cache=None) as client,
         ):
             yield client
 

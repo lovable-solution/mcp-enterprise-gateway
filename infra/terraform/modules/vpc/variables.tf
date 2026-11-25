@@ -58,6 +58,12 @@ variable "flow_logs_retention_days" {
   }
 }
 
+variable "logs_kms_key_arn" {
+  description = "KMS key for this module's CloudWatch log group (null: AWS-managed encryption). Its key policy must allow the CloudWatch Logs service principal (the secrets_manager module's key does)."
+  type        = string
+  default     = null
+}
+
 variable "tags" {
   description = "Extra tags for this module's resources (provider default_tags already apply)."
   type        = map(string)

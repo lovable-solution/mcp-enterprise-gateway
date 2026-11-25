@@ -77,6 +77,7 @@ class Approval(BaseModel):
     result: dict[str, Any] | None = None
     """The upstream ``CallToolResult`` (wire format) once EXECUTED."""
     error: str | None = None
+    status_changed_at: datetime | None = None
 
 
 class AuditEntry(BaseModel):

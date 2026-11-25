@@ -103,7 +103,11 @@ class CrmStore:
             ),
             credit_limit_usd=account.credit_limit_usd,
             credit_utilisation=round(receivables / max(account.credit_limit_usd, 1), 4),
-            days_sales_outstanding=round(receivables / account.annual_revenue_usd * 365),
+            days_sales_outstanding=(
+                round(receivables / account.annual_revenue_usd * 365)
+                if account.annual_revenue_usd
+                else 0  # no revenue yet: DSO is undefined, report 0 rather than fail
+            ),
             risk_rating=account.risk_rating,
             as_of=self._clock(),
         )

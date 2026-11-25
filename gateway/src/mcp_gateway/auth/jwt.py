@@ -13,6 +13,8 @@ Hardening beyond signature checks:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -28,13 +30,22 @@ from .principal import Principal
 
 _REQUIRED_CLAIMS = ("tenant_id", "role")
 
+logger = logging.getLogger(__name__)
+
 
 class TokenError(Exception):
     """The bearer token is unusable; the message is safe to return to the caller."""
 
 
 class JWKSCache:
-    """Signing keys of the IdP, by ``kid``."""
+    """Signing keys of the IdP, by ``kid``.
+
+    A known ``kid`` is always served from the cache; a stale cache is refreshed in the
+    background. Only an unknown ``kid`` (key rotation) or an empty cache waits for a fetch.
+    Fetches are single-flight and rate-limited whether they succeed or fail, so an IdP
+    outage costs at most one attempt per ``min_refresh_interval_seconds``, never one per
+    request.
+    """
 
     def __init__(
         self,
@@ -43,25 +54,29 @@ class JWKSCache:
         *,
         ttl_seconds: float = 600.0,
         min_refresh_interval_seconds: float = 30.0,
+        fetch_timeout_seconds: float = 5.0,
     ) -> None:
         self._url = url
         self._http = http_client
         self._ttl = ttl_seconds
         self._min_refresh = min_refresh_interval_seconds
+        self._fetch_timeout = fetch_timeout_seconds
         self._keys: list[dict[str, Any]] = []
         self._fetched_at = float("-inf")
+        self._last_attempt = float("-inf")
         self._lock = anyio.Lock()
+        self._background: asyncio.Task[None] | None = None
 
     async def key(self, kid: str | None) -> dict[str, Any]:
-        now = time.monotonic()
-        if now - self._fetched_at > self._ttl:
-            await self._refresh()
         found = self._select(kid)
-        if found is None and time.monotonic() - self._fetched_at > self._min_refresh:
-            await self._refresh()  # possibly a newly rotated key
-            found = self._select(kid)
+        if found is not None:
+            if time.monotonic() - self._fetched_at > self._ttl:
+                self._refresh_in_background()
+            return found
+        await self._refresh()  # unknown kid (rotation?) or nothing cached yet
+        found = self._select(kid)
         if found is None:
-            raise TokenError("unknown signing key")
+            raise TokenError("unknown signing key" if self._keys else "signing keys unavailable")
         return found
 
     def _select(self, kid: str | None) -> dict[str, Any] | None:
@@ -69,16 +84,23 @@ class JWKSCache:
             return next((k for k in self._keys if k.get("kid") == kid), None)
         return self._keys[0] if len(self._keys) == 1 else None
 
+    def _refresh_in_background(self) -> None:
+        if self._background is None or self._background.done():
+            self._background = asyncio.create_task(self._refresh(), name="jwks-refresh")
+
     async def _refresh(self) -> None:
         async with self._lock:
+            now = time.monotonic()
+            if now - self._last_attempt < self._min_refresh:
+                return  # another request just refreshed (or tried): do not hammer the IdP
+            self._last_attempt = now
             try:
-                response = await self._http.get(self._url, timeout=5.0)
+                response = await self._http.get(self._url, timeout=self._fetch_timeout)
                 response.raise_for_status()
                 keys = response.json().get("keys", [])
-            except (httpx2.HTTPError, ValueError) as exc:
-                if not self._keys:
-                    raise TokenError("signing keys unavailable") from exc
-                return  # keep serving the last good key set
+            except (httpx2.HTTPError, ValueError, AttributeError):
+                logger.warning("JWKS refresh failed; keeping %d cached keys", len(self._keys))
+                return
             self._keys = [k for k in keys if isinstance(k, dict) and k.get("use", "sig") == "sig"]
             self._fetched_at = time.monotonic()
 
