@@ -21,40 +21,40 @@ an internal load balancer, with no hardcoded secrets.
 
 ```mermaid
 flowchart LR
-  subgraph agents["Agents"]
+  subgraph callers["Callers"]
+    direction TB
     runtime["Agent runtime<br/>LangGraph + PydanticAI"]
     client["Any MCP client"]
+    operator(("Operator"))
   end
-  operator(("Operator"))
+
   claude["Claude API"]
+  checkpoints[("PostgreSQL<br/>agent checkpoints<br/>(the runtime's<br/>own database)")]
 
-  subgraph platform["Governed by the gateway"]
-    gateway["MCP gateway<br/>auth · policy · loop breaker<br/>budgets · approvals"]
-    console["Operator console<br/>Next.js backend-for-frontend"]
+  subgraph governed["Governed entry points"]
+    direction TB
+    gateway["MCP gateway<br/>auth · policy · budgets<br/>loop breaker · approvals"]
+    console["Operator console<br/>Next.js<br/>backend-for-frontend"]
   end
 
-  subgraph servers["MCP servers: reachable from the gateway only"]
-    crm["crm-ops<br/>search · metrics · credit limits"]
+  subgraph servers["MCP servers: gateway only"]
+    crm["crm-ops<br/>search · metrics<br/>credit limits"]
   end
 
-  pg[("PostgreSQL<br/>approvals · agent checkpoints")]
-  redis[("Redis<br/>budgets · breakers · event streams")]
+  approvals[("PostgreSQL<br/>approval store<br/>(the gateway's<br/>own database)")]
+  redis[("Redis<br/>budgets · breakers<br/>event streams")]
   idp["Identity provider<br/>JWKS"]
-  otel["OpenTelemetry Collector<br/>traces · metrics"]
 
   runtime -->|"MCP + JWT"| gateway
   client -->|"MCP + JWT"| gateway
-  runtime -->|"model calls"| claude
-  runtime -->|"checkpoints"| pg
+  runtime -.->|"model calls"| claude
+  runtime -.->|"checkpoints"| checkpoints
   operator -->|"browser"| console
-  console -->|"control-plane API, server-side"| gateway
-  gateway -->|"signed identity assertion"| crm
-  gateway --> pg
+  console -->|"control-plane API"| gateway
+  gateway -->|"signed assertion"| crm
+  gateway --> approvals
   gateway --> redis
   gateway -.->|"signing keys"| idp
-  gateway -.-> otel
-  crm -.-> otel
-  runtime -.-> otel
 ```
 
 | Component | Role |
@@ -72,22 +72,22 @@ structured verdict (`_meta["mcp-enterprise-gateway/governance"]`) that agents ac
 
 ```mermaid
 flowchart TD
-  req(["tools/call from an agent"]) --> authn{"Valid JWT?<br/>issuer, audience,<br/>algorithm allow-list"}
-  authn -->|"no"| unauthorised["401: the request never reaches the pipeline"]
-  authn -->|"yes"| loop{"4th identical call in 60 s,<br/>or breaker already open?"}
-  loop -->|"yes"| open["CIRCUIT_OPEN<br/>session paused until it cools down or is reset"]
-  loop -->|"no"| rbac{"Does the policy let<br/>this role call this tool?"}
+  req(["tools/call from an agent"]) --> authn{"Valid JWT?"}
+  authn -->|"no"| unauthorised["401: bad signature,<br/>issuer, audience<br/>or algorithm"]
+  authn -->|"yes"| loop{"4th identical call<br/>in 60 s, or breaker<br/>already open?"}
+  loop -->|"yes"| open["CIRCUIT_OPEN<br/>session paused until it<br/>cools down or is reset"]
+  loop -->|"no"| rbac{"Role allowed<br/>this tool?"}
   rbac -->|"no: default deny"| denied["Unknown tool<br/>tool_call.denied event"]
-  rbac -->|"yes"| args{"Upstream available,<br/>arguments match its schema?"}
-  args -->|"no"| invalid["UPSTREAM_UNAVAILABLE or<br/>INVALID_ARGUMENTS"]
+  rbac -->|"yes"| args{"Tool online,<br/>arguments valid?"}
+  args -->|"no"| invalid["UPSTREAM_UNAVAILABLE<br/>or INVALID_ARGUMENTS"]
   args -->|"yes"| budget{"Budget left?<br/>calls · tokens · USD"}
   budget -->|"no"| exhausted["BUDGET_EXCEEDED"]
   budget -->|"yes"| gate{"Needs human<br/>approval?"}
-  gate -->|"yes"| held["Stored as PENDING_APPROVAL<br/>console and webhook notified<br/>held up to the inline wait"]
-  held -->|"decided in time"| decided["APPROVED: the real result<br/>REJECTED: the reviewer's reason"]
+  gate -->|"yes"| held["Stored as pending,<br/>operators notified,<br/>held for the inline wait"]
+  held -->|"decided in time"| decided["APPROVED: the result<br/>REJECTED: the reason"]
   held -->|"still undecided"| pending["PENDING_APPROVAL<br/>the agent checkpoints"]
-  gate -->|"no"| forward["Charge the budget atomically, then call the<br/>MCP server with a signed identity assertion"]
-  forward --> result["Result + session.activity event"]
+  gate -->|"no"| forward["Charge the budget<br/>atomically, then call<br/>the MCP server with a<br/>signed assertion"]
+  forward --> result["Result returned,<br/>session.activity event"]
   forward -.->|"server never reached"| refunded["UPSTREAM_UNAVAILABLE<br/>charge refunded"]
   forward -.->|"no answer"| unknown["OUTCOME_UNKNOWN<br/>check before repeating"]
 ```
@@ -110,9 +110,9 @@ sequenceDiagram
   G->>P: insert PENDING_APPROVAL (payload frozen)
   G->>R: approval.requested
   R-->>C: live event (SSE)
-  Note over G: holds the call for the inline wait, sending progress
+  Note over G: holds the call for the inline wait,<br/>sending progress notifications
   G-->>A: PENDING_APPROVAL with the approval id
-  Note over A: interrupt(), thread checkpointed, the process may exit
+  Note over A: interrupt(): thread checkpointed,<br/>the process may exit
   C->>G: decide: approve (operator, not the requester)
   G->>P: APPROVED, then EXECUTING (claimed exactly once)
   G->>M: the stored payload, with a signed identity assertion
@@ -245,11 +245,11 @@ the gateway budgets, rate-limits and audits each thread as one session.
 
 ```mermaid
 flowchart LR
-  entry(["START"]) --> agent["agent<br/>PydanticAI run over the thread's history"]
-  agent -->|"answer, halted or failed"| finish(["END"])
-  agent -->|"a call is held for approval"| wait["await_approval<br/>interrupt(): checkpointed, the process may exit"]
-  wait -->|"resumed, but still pending"| wait
-  wait -->|"every held call decided,<br/>as reported by the gateway"| agent
+  entry(["START"]) --> agent["agent<br/>PydanticAI run over<br/>the thread's history"]
+  agent -->|"answer, halt or failure"| finish(["END"])
+  agent -->|"a call held for approval"| wait["await_approval<br/>interrupt() checkpoints;<br/>the process may exit"]
+  wait -->|"still pending"| wait
+  wait -->|"all decided<br/>(per the gateway)"| agent
 ```
 
 The toolset turns each gateway verdict into agent control flow:
@@ -310,44 +310,34 @@ handlers call the gateway with the operator's token, which is kept in an encrypt
 Nothing listens on a public address.
 
 ```mermaid
-flowchart TB
+flowchart LR
   clients["Agents and operators<br/>alb_ingress_cidrs only"]
-  idp["Identity provider<br/>JWKS"]
-  anthropic["Claude API"]
+  internet["Identity provider JWKS<br/>Claude API"]
 
   subgraph vpc["VPC: 2-3 availability zones"]
-    subgraph public["public subnets"]
-      nat["NAT gateway"]
-    end
-    subgraph app["private-app subnets: no public IPs"]
-      alb["Internal ALB<br/>HTTPS only, TLS 1.3 / 1.2"]
-      gateway["gateway<br/>autoscaled"]
+    direction TB
+    subgraph app["private-app subnets"]
+      alb["Internal ALB<br/>HTTPS only<br/>TLS 1.3 / 1.2"]
       console["operator-ui"]
+      gateway["gateway<br/>autoscaled"]
       crm["crm-ops<br/>admits the gateway only"]
-      tasks["on-demand tasks<br/>db-bootstrap · agent-runtime"]
-      endpoints["VPC endpoints<br/>ECR · Secrets Manager · Logs · STS · KMS"]
     end
-    subgraph data["private-data subnets: no route out"]
-      rds[("RDS PostgreSQL<br/>TLS only, RDS-managed master secret")]
+    subgraph data["private-data subnets"]
+      rds[("RDS PostgreSQL<br/>TLS only")]
       cache[("ElastiCache<br/>TLS + AUTH, noeviction")]
     end
+    nat["NAT gateway<br/>public subnets"]
+    alb -->|"/mcp · /v1/*"| gateway
+    alb -->|"everything else"| console
+    console -->|"Service Connect"| gateway
+    gateway -->|"Service Connect"| crm
+    gateway --->|"5432"| rds
+    gateway --->|"6379 TLS"| cache
+    gateway -.->|"443"| nat
   end
-  secrets["Secrets Manager<br/>KMS key with rotation"]
 
-  clients -->|"443"| alb
-  alb -->|"/mcp · /v1/* · health"| gateway
-  alb -->|"everything else"| console
-  console -->|"Service Connect"| gateway
-  gateway -->|"Service Connect"| crm
-  gateway -->|"5432"| rds
-  gateway -->|"6379 TLS"| cache
-  tasks -->|"5432"| rds
-  tasks -->|"agent: through the ALB, like any agent"| alb
-  gateway -->|"443"| nat
-  tasks -->|"443"| nat
-  nat --> idp
-  nat --> anthropic
-  endpoints -.->|"secrets injected at task start"| secrets
+  clients -->|"443 to the ALB"| vpc
+  vpc -.->|"443 out via the NAT"| internet
 ```
 
 - **One way in.** The internal ALB exposes only the gateway and the console, and only on
@@ -355,6 +345,11 @@ flowchart TB
 - **MCP servers are east-west only.** They are reached over ECS Service Connect, and each
   admits only the gateway's security group. Every workload has its own security group,
   with least-privilege egress.
+- **No route out from the data tier.** RDS and ElastiCache sit in subnets with local
+  routes only, and admit only the security groups of the workloads that use them.
+- **On-demand tasks.** `db-bootstrap` creates the service roles and databases.
+  `agent-runtime` reaches the gateway through the ALB like any other agent, and keeps its
+  checkpoints in its own database.
 - **Zero hardcoded secrets.** Generated secrets are written with write-only arguments, so
   they appear in neither plans nor state. ElastiCache reads its AUTH token back
   ephemerally. RDS manages and rotates its own master credential, and only the one-off
