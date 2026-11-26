@@ -365,7 +365,7 @@ without an AWS account: plan-time tests run every module against mocked provider
 
 | Command | What runs |
 | --- | --- |
-| `make test` | 242 Python tests in about 50 s, including 53 integration tests against real PostgreSQL and Redis (`make up`), real gateway and crm-ops servers, and the official MCP client |
+| `make test` | 242 Python tests in about 50 s, including 52 integration tests against real PostgreSQL and Redis (`make up`), real gateway and crm-ops servers, and the official MCP client |
 | `make ui-check` | the console's ESLint, TypeScript and 29 unit tests |
 | `make tf-test` | 33 Terraform tests across the five modules and the dev environment, with mocked AWS (no account, no cost) |
 | `make test-live` | the pause, approve and resume flow with real Claude; prints its cost (opt-in) |
