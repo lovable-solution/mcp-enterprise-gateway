@@ -57,6 +57,7 @@ ignore = [
 "**/tests/**" = ["S101", "PLR2004", "PLR0917"]  # tests take fixtures positionally
 "**/cli.py" = ["T201"]
 "**/devtools/*.py" = ["T201"]
+"scripts/*.py" = ["T201", "S311"]  # demo scripts print progress; random only paces them
 "mcp-servers/crm-ops/src/crm_ops/store.py" = ["E501"]  # seed data: one account per line
 "**/errors.py" = ["N818"]  # HTTP problem types read best as Unauthorized, Forbidden, ...
 

@@ -8,8 +8,34 @@ import {
   isApprovalId,
   isSameOrigin,
   isSessionId,
+  MAX_HISTORY_MS,
+  resumeFrom,
   signInSchema,
 } from "@/lib/validation";
+
+describe("event stream resume point", () => {
+  const now = Date.parse("2026-11-26T12:00:00Z");
+  const params = (query: string) => new URLSearchParams(query);
+
+  it("prefers the browser's Last-Event-ID, then ?after=, then ?since=", () => {
+    const since = now - 15 * 60_000;
+    const lastId = `${now - 60_000}-3`;
+    expect(resumeFrom(lastId, params(`after=1-0&since=${since}`), now)).toBe(lastId);
+    expect(resumeFrom(null, params(`after=${lastId}&since=${since}`), now)).toBe(lastId);
+    expect(resumeFrom(null, params(`since=${since}`), now)).toBe(`${since}-0`);
+    expect(resumeFrom(null, params(""), now)).toBeNull();
+  });
+
+  it("passes only well-formed ids and bounds how far back history goes", () => {
+    for (const bad of ["1-0\r\nX-Injected: 1", "abc", "1764158400000"]) {
+      expect(resumeFrom(bad, params(""), now)).toBeNull();
+      expect(resumeFrom(null, params(`after=${encodeURIComponent(bad)}`), now)).toBeNull();
+    }
+    expect(resumeFrom(null, params("since=42"), now)).toBeNull();
+    expect(resumeFrom(null, params("since=1000000000000"), now)).toBe(`${now - MAX_HISTORY_MS}-0`);
+    expect(resumeFrom(null, params(`since=${now + 60_000}`), now)).toBe(`${now}-0`);
+  });
+});
 
 describe("route parameters", () => {
   it("accepts only approval UUIDs, so no other gateway path can be reached", () => {

@@ -141,11 +141,24 @@ describe("sessions and spend", () => {
     let state = reduce(initialState, { type: "sessions/loaded", sessions: [session("t-1", { cost_usd: "1.00" })], at: T0 });
     state = reduce(state, {
       type: "event",
-      event: event("session.activity", { budget: budget({ cost_usd: "1.50" }) }),
+      event: { ...event("session.activity", { budget: budget({ cost_usd: "1.50" }) }), occurred_at: new Date(T0 + 120_000).toISOString() },
       at: T0 + 120_000,
     });
     expect(burnPerMinute(state, T0 + 120_000)).toBeCloseTo(0.25); // $0.50 over 2 minutes
     expect(burnPerMinute(initialState, T0)).toBeNull();
+  });
+
+  it("keeps replayed history out of the burn rate and never lets an older snapshot win", () => {
+    let state = reduce(initialState, {
+      type: "sessions/loaded",
+      sessions: [session("t-1", { cost_usd: "1.00" }, T0 + 60_000)],
+      at: T0 + 60_000,
+    });
+    const history = { ...event("session.activity", { budget: budget({ cost_usd: "0.40" }) }), occurred_at: new Date(T0).toISOString() };
+    state = reduce(state, { type: "event", event: history, at: T0 + 120_000 });
+    expect(state.sessions["t-1"]?.budget.cost_usd).toBe("1.00"); // the newer snapshot stands
+    expect(state.spend).toHaveLength(1); // history is not a spend sample "now"
+    expect(state.events).toHaveLength(1); // but it is in the activity log
   });
 
   it("classifies budgets: ok, warning (by ratio or the gateway's warning), exhausted", () => {
@@ -194,6 +207,19 @@ describe("circuit breakers", () => {
     expect(state.sessions["t-1"]?.circuit_breaker.open).toBe(false);
     expect(state.alerts[0]?.resolved).toBe(true);
     expect(kpis(state, T0).openAlerts).toBe(0);
+  });
+
+  it("resolves a loop alert once a snapshot shows the breaker cooled down by itself", () => {
+    const trip = event("circuit_breaker.tripped", { tool: "crm-ops__search_accounts", subject: "crm-copilot" });
+    const trippedAt = Date.parse(trip.occurred_at);
+    let state = apply(reduce(initialState, { type: "sessions/loaded", sessions: [session("t-1")], at: T0 }), trip);
+    // A snapshot read around the trip itself proves nothing yet.
+    state = reduce(state, { type: "sessions/loaded", sessions: [session("t-1")], at: trippedAt + 2_000 });
+    expect(state.alerts[0]?.resolved).toBe(false);
+    // Five minutes on, the breaker is closed: the alert is history.
+    state = reduce(state, { type: "sessions/loaded", sessions: [session("t-1")], at: trippedAt + 300_000 });
+    expect(state.alerts[0]?.resolved).toBe(true);
+    expect(kpis(state, trippedAt + 300_000).openAlerts).toBe(0);
   });
 
   it("lets an operator dismiss alerts", () => {

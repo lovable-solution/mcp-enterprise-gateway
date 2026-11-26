@@ -66,6 +66,31 @@ export const approvalListQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
+const STREAM_ID = /^\d+-\d+$/;
+const EPOCH_MS = /^\d{13}$/;
+/** The furthest back a console may ask for event history (the gateway's stream is capped). */
+export const MAX_HISTORY_MS = 24 * 60 * 60 * 1000;
+
+/** Where the gateway event stream should resume, in priority order: the browser's own
+ * Last-Event-ID (an automatic reconnect), `?after=<stream id>` (the console reconnecting by
+ * hand), or `?since=<epoch ms>` (a fresh console asking for recent history: Redis stream
+ * ids start with their millisecond timestamp). Anything else starts with live events. */
+export function resumeFrom(lastEventId: string | null, params: URLSearchParams, now = Date.now()): string | null {
+  if (lastEventId && STREAM_ID.test(lastEventId)) {
+    return lastEventId;
+  }
+  const after = params.get("after");
+  if (after && STREAM_ID.test(after)) {
+    return after;
+  }
+  const since = params.get("since");
+  if (since && EPOCH_MS.test(since)) {
+    const at = Math.min(Number(since), now);
+    return `${Math.max(at, now - MAX_HISTORY_MS)}-0`;
+  }
+  return null;
+}
+
 /** Same-origin check for state-changing requests (defence in depth: the session cookie
  * is SameSite=Strict, so a cross-site request does not carry it in the first place). */
 export function isSameOrigin(request: Request): boolean {

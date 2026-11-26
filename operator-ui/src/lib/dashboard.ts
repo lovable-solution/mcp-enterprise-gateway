@@ -14,10 +14,15 @@ export const ACTIVE_WINDOW_MS = 15 * 60 * 1000;
 /** The shipped policy's `budgets.warn_at_ratio`; the gateway's own budget.warning events
  * flag a session too. */
 export const WARN_AT_RATIO = 0.8;
-const MAX_EVENTS = 100;
+/** Enough live history for the activity log and its 15-minute histogram. */
+export const MAX_EVENTS = 400;
 const MAX_ALERTS = 50;
-const MAX_SEEN = 500;
+const MAX_SEEN = 1000;
 const BURN_WINDOW_MS = 5 * 60 * 1000;
+/** An event that arrives later than this after it happened is history (the console loads
+ * recent history when it connects): it updates state but is not a spend sample "now". */
+const LIVE_LAG_MS = 15_000;
+const BREAKER_SETTLE_MS = 10_000;
 
 export type Severity = "warning" | "serious" | "critical";
 
@@ -86,7 +91,17 @@ export function reduce(state: DashboardState, action: Action): DashboardState {
       for (const status of action.sessions) {
         sessions[status.session.session_id] = status;
       }
-      return withSpendSample({ ...state, sessions }, action.at);
+      // A breaker that cools down on its own emits no event: the snapshot is how the
+      // console learns it closed. A trip younger than the settle time is left alone, in
+      // case this snapshot was read just before the trip.
+      const alerts = state.alerts.map((alert) => {
+        const status = alert.sessionId === null ? undefined : sessions[alert.sessionId];
+        const settled = action.at - Date.parse(alert.at) > BREAKER_SETTLE_MS;
+        return alert.kind === "breaker" && !alert.resolved && status && !status.circuit_breaker.open && settled
+          ? { ...alert, resolved: true }
+          : alert;
+      });
+      return withSpendSample({ ...state, sessions, alerts }, action.at);
     }
     case "event":
       return applyEvent(state, action.event, action.at);
@@ -167,7 +182,9 @@ function applyEvent(state: DashboardState, event: GatewayEvent, at: number): Das
           resolved: false,
         });
       }
-      next = withSpendSample(next, at);
+      if (at - Date.parse(event.occurred_at) <= LIVE_LAG_MS) {
+        next = withSpendSample(next, at);
+      }
       break;
     }
     case "circuit_breaker.tripped":
@@ -265,6 +282,9 @@ function patchSession(
   budget: BudgetSnapshot,
 ): DashboardState {
   const existing = state.sessions[sessionId];
+  if (existing && Date.parse(existing.session.last_seen) > Date.parse(event.occurred_at)) {
+    return state; // an older snapshot (history or a late event) never overwrites a newer one
+  }
   const status: SessionStatus = existing
     ? { ...existing, budget, session: { ...existing.session, last_seen: event.occurred_at } }
     : {

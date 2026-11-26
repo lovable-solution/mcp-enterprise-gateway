@@ -2,26 +2,25 @@ import type { NextRequest } from "next/server";
 
 import { config } from "@/lib/config";
 import { currentSession, problem } from "@/lib/server";
+import { resumeFrom } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 
-const STREAM_ID = /^\d+-\d+$/;
-
-/** The gateway's server-sent event stream, relayed with the operator's token. The
- * browser's EventSource sends Last-Event-ID on reconnect; passing it through resumes the
- * gateway stream exactly where it stopped. */
+/** The gateway's server-sent event stream, relayed with the operator's token. A fresh
+ * console asks for recent history (`?since=`); a reconnect resumes exactly where the
+ * stream stopped (Last-Event-ID or `?after=`). */
 export async function GET(request: NextRequest): Promise<Response> {
   const session = await currentSession();
   if (session === null) {
     return problem(401, "Sign-in required");
   }
-  const lastEventId = request.headers.get("last-event-id");
   const headers: Record<string, string> = {
     Authorization: `Bearer ${session.token}`,
     Accept: "text/event-stream",
   };
-  if (lastEventId && STREAM_ID.test(lastEventId)) {
-    headers["Last-Event-ID"] = lastEventId;
+  const resume = resumeFrom(request.headers.get("last-event-id"), request.nextUrl.searchParams);
+  if (resume) {
+    headers["Last-Event-ID"] = resume;
   }
   let upstream: Response;
   try {

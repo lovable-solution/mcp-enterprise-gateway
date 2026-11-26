@@ -133,3 +133,36 @@ export interface Operator {
    * Only shapes the UI: the gateway authorises every request itself. */
   actions: string[];
 }
+
+// --- GET /v1/policy (mcp_gateway.api.policy) ---------------------------------------------
+
+export type PolicyAccess = "allow" | "approval" | "deny";
+
+export interface PolicyTool {
+  name: string;
+  access: string;
+  risk: string;
+  requires_approval: boolean;
+  approver_roles: string[];
+  /** Exact decimal string, e.g. "0.002". */
+  cost_usd_per_call: string;
+  /** Whether the upstream server currently offers the tool. */
+  available: boolean;
+}
+
+export interface PolicyRole {
+  name: string;
+  description: string;
+  actions: string[];
+}
+
+export interface PolicySummary {
+  name: string;
+  digest: string;
+  roles: PolicyRole[];
+  tools: PolicyTool[];
+  /** role -> tool -> effective access. */
+  matrix: Record<string, Record<string, PolicyAccess>>;
+  /** upstream server -> "ok", "pending" or the last error. */
+  upstreams: Record<string, string>;
+}

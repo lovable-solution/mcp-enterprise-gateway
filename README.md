@@ -62,7 +62,7 @@ flowchart LR
 | `gateway/` | FastAPI + the official MCP SDK. The single entry point for agents (`/mcp`) and the control plane (`/v1/*`): approvals, sessions, events (SSE), usage reports. |
 | `mcp-servers/crm-ops/` | A sample MCP server with three CRM tools. It trusts only short-lived identity assertions signed by the gateway, and scopes every lookup to the asserted tenant. |
 | `agent-runtime/` | A LangGraph graph around a PydanticAI agent (Claude Opus 5.5). It turns the gateway's verdicts into control flow, and checkpoints in PostgreSQL while a human decides. |
-| `operator-ui/` | Next.js 15 console with an approval queue, a JSON payload viewer, live token and dollar burn, and breaker alerts. Operator tokens never reach the browser. |
+| `operator-ui/` | Next.js 15 console: live traffic through the gateway, the approval queue with each call's exact payload, session spend against caps, alerts, events and the enforced policy. Operator tokens never reach the browser. |
 | `infra/terraform/` | VPC, ECS Fargate, RDS PostgreSQL, ElastiCache, Secrets Manager. |
 
 ## How a tool call is governed
@@ -200,9 +200,9 @@ crm-ops publishes no port: it is reachable from the gateway only.
    PostgreSQL and the command exits with code 2 and the thread id. Nothing has changed
    in the CRM.
 2. **Decide.** Open http://localhost:3000 and use *Development sign-in* as an
-   `operator`. The held call shows its exact arguments. *Approve and run* executes the
-   stored payload; *Reject* needs a reason. The console also shows each session's live
-   token and dollar burn, and any alerts.
+   `operator`. The held call waits under *Approvals* with its exact arguments, the
+   agent's reasoning and a countdown to expiry. Approving a high-risk call takes a
+   press-and-hold, and the gateway then runs the stored payload; *Reject* needs a reason.
 3. **Resume.** `make agent-resume THREAD=t-...` starts a fresh container, loads the
    thread from its checkpoint and asks the gateway for the outcome. The agent then
    reports what happened, including a rejection and its reason. A resume before the
@@ -213,6 +213,15 @@ from `make -s token ROLE=admin`:
 - `analyst` sees only the two read tools;
 - the fourth identical call within 60 s trips the session's circuit breaker, and the
   console offers *Reset*.
+
+To watch the console under load without calling a model, run `make demo-traffic`
+(`DURATION=180` for longer). Four `demo-` agents make real calls through the gateway:
+- reads, with reported (not generated) model usage;
+- one denied write;
+- one credit-limit change held for approval;
+- one loop that trips its breaker.
+
+Nothing is billed. The held demo call expires unexecuted unless someone decides it.
 
 ## The policy
 
@@ -285,13 +294,28 @@ four model requests) costs about $0.03 in model usage.
 
 ## The operator console
 
-`operator-ui/` is a backend-for-frontend. The browser talks only to the console. Its route
-handlers call the gateway with the operator's token, which is kept in an encrypted
-(A256GCM), httpOnly, SameSite=Strict cookie and never reaches page scripts.
+`operator-ui/` has five views behind one live connection:
+
+| View | What it is for |
+| --- | --- |
+| Overview | The live traffic gate, key figures with sparklines, held calls, alerts, busiest sessions |
+| Approvals | Held and decided calls: the change, the agent's reasoning, the payload, the audit trail |
+| Sessions | Spend, tokens and calls against each session's caps; breaker state and reset |
+| Activity | Every event of the last 15 minutes, then live, with a histogram and filters |
+| Policy | The enforced role × tool matrix, upstream health and each role's console actions |
+
+The live traffic gate draws every real tool call: an allowed call passes the gateway to
+its server, a denied call bounces off, and a held call waits at the gate until someone
+decides it. Nothing on it is simulated. Motion follows the OS *reduce motion* setting.
+The console has light and dark themes and a ⌘K command palette.
+
+It is a backend-for-frontend. The browser talks only to the console. Its route handlers
+call the gateway with the operator's token, which is kept in an encrypted (A256GCM),
+httpOnly, SameSite=Strict cookie and never reaches page scripts.
 - **Requests:** state-changing calls also pass a same-origin check. Route parameters are
   validated before they become gateway URLs.
-- **Live updates:** the gateway's event stream is relayed as SSE, resuming with
-  `Last-Event-ID`.
+- **Live updates:** the gateway's event stream is relayed as SSE. A fresh console replays
+  the last 15 minutes, then streams live; a reconnect resumes with `Last-Event-ID`.
 - **Permissions:** what a role may do (decide, reset breakers) comes from the gateway's
   policy at sign-in, and the gateway re-checks every request.
 - **Sign-in:** locally, *Development sign-in* mints a short-lived token with the gateway's
@@ -366,7 +390,7 @@ without an AWS account: plan-time tests run every module against mocked provider
 | Command | What runs |
 | --- | --- |
 | `make test` | 242 Python tests in about 50 s, including 52 integration tests against real PostgreSQL and Redis (`make up`), real gateway and crm-ops servers, and the official MCP client |
-| `make ui-check` | the console's ESLint, TypeScript and 29 unit tests |
+| `make ui-check` | the console's ESLint, TypeScript and 54 unit tests |
 | `make tf-test` | 33 Terraform tests across the five modules and the dev environment, with mocked AWS (no account, no cost) |
 | `make test-live` | the pause, approve and resume flow with real Claude; prints its cost (opt-in) |
 

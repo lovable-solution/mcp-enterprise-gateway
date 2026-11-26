@@ -121,6 +121,9 @@ ui-dev: ## Run the console with hot reload on :3000 against the local gateway
 		GATEWAY_JWT_SECRET="$$(grep '^GATEWAY_JWT_SECRET=' ../.env | cut -d= -f2-)" \
 		pnpm dev
 
+demo-traffic: ## Live demo traffic for the console, no model calls: make demo-traffic DURATION=180
+	$(UV_RUN) python scripts/demo_traffic.py --seconds $(or $(DURATION),90)
+
 ##@ Agent runtime
 # The prompt is passed verbatim: $(value) stops make expanding "$600" and the single
 # quotes stop the shell doing so (embedded single quotes are escaped).
